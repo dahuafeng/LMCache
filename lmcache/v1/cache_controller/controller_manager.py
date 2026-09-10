@@ -51,7 +51,9 @@ from lmcache.v1.cache_controller.message import (  # isort: skip
     PinMsg,
     QueryInstMsg,
     QueryWorkerInfoMsg,
+    RestoreLocalCPUMsg,
     RegisterMsg,
+    SnapshotLocalCPUMsg,
     WorkerMsg,
     WorkerReqMsg,
     WorkerReqRetMsg,
@@ -146,6 +148,16 @@ class LMCacheControllerManager:
             await self.reg_controller.register(msg)
         elif isinstance(msg, DeRegisterMsg):
             await self.reg_controller.deregister(msg)
+        elif isinstance(msg, (KVAdmitMsg, KVEvictMsg)):
+            # CXL publication and a few legacy workers still send the full
+            # operation message directly.  The controller normally receives
+            # BatchedKVOperationMsg, but dropping these direct messages makes
+            # the controller-side residency index diverge from the backend.
+            self.kv_controller.check_sequence_number(msg)
+            if isinstance(msg, KVAdmitMsg):
+                await self.kv_controller.admit(msg)
+            else:
+                await self.kv_controller.evict(msg)
         elif isinstance(msg, BatchedKVOperationMsg):
             # Reconstruct full KV messages from lightweight operations
             instance_id = msg.instance_id
@@ -191,6 +203,10 @@ class LMCacheControllerManager:
             return await self.reg_controller.get_instance_id(msg)
         elif isinstance(msg, ClearMsg):
             return await self.kv_controller.clear(msg)
+        elif isinstance(msg, SnapshotLocalCPUMsg):
+            return await self.kv_controller.snapshot_local_cpu(msg)
+        elif isinstance(msg, RestoreLocalCPUMsg):
+            return await self.kv_controller.restore_local_cpu(msg)
         elif isinstance(msg, PinMsg):
             return await self.kv_controller.pin(msg)
         elif isinstance(msg, CompressMsg):

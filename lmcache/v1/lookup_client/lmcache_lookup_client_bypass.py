@@ -8,7 +8,10 @@ import torch
 # First Party
 from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
-from lmcache.v1.cache_engine import LMCacheEngine
+from lmcache.v1.cache_engine import (
+    LMCacheEngine,
+    _add_cxl_prefetch_key_offset,
+)
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 
@@ -63,13 +66,23 @@ class LMCacheBypassLookupClient(LookupClientInterface):
         num_computed_tokens: int = 0,
     ) -> Optional[int]:
         try:
+            aligned_computed_tokens = num_computed_tokens  # pre-aligned in adapter
+            chunk_size = getattr(self.token_database, "chunk_size", None)
+            key_offset = (
+                aligned_computed_tokens // int(chunk_size)
+                if chunk_size is not None and int(chunk_size) > 0
+                else 0
+            )
+            request_configs = _add_cxl_prefetch_key_offset(
+                request_configs,
+                key_offset,
+            )
             if not self.enable_blending:
                 # Process tokens to get hashes and offsets
                 hashes = []
                 offsets = []
                 # We already have hashes here so we can skip the chunks that are already
                 # in GPU cache. Don't pass num_computed_tokens to engine.
-                aligned_computed_tokens = num_computed_tokens  # pre-aligned in adapter
                 result = aligned_computed_tokens
                 for start, end, key in self.token_database.process_tokens(
                     token_ids, make_key=False

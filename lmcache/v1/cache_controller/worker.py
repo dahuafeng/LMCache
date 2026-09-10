@@ -45,6 +45,10 @@ from lmcache.v1.cache_controller.message import (
     PinWorkerMsg,
     PinWorkerRetMsg,
     RegisterMsg,
+    RestoreLocalCPUWorkerMsg,
+    RestoreLocalCPUWorkerRetMsg,
+    SnapshotLocalCPUWorkerMsg,
+    SnapshotLocalCPUWorkerRetMsg,
     WorkerMsg,
     WorkerReqMsg,
     WorkerReqRetMsg,
@@ -589,9 +593,40 @@ class LMCacheWorker:
                 elif isinstance(request, ClearWorkerMsg):
                     num_cleared_tokens = self.lmcache_engine.clear(
                         locations=[request.location],
+                        keep_fraction=request.keep_fraction,
                     )
                     serialized_ret_msg = msgspec.msgpack.encode(
                         ClearWorkerRetMsg(num_tokens=num_cleared_tokens)
+                    )
+                elif isinstance(request, SnapshotLocalCPUWorkerMsg):
+                    result = self.lmcache_engine.snapshot_local_cpu(request.path)
+                    serialized_ret_msg = msgspec.msgpack.encode(
+                        SnapshotLocalCPUWorkerRetMsg(
+                            worker_event_id=request.worker_event_id,
+                            worker_id=self.worker_id,
+                            entries=int(result["entries"]),
+                            tokens=int(result["tokens"]),
+                            bytes=int(result["bytes"]),
+                            digest=str(result["digest"]),
+                        )
+                    )
+                elif isinstance(request, RestoreLocalCPUWorkerMsg):
+                    result = self.lmcache_engine.restore_local_cpu(
+                        request.path,
+                        clear_existing=request.clear_existing,
+                    )
+                    serialized_ret_msg = msgspec.msgpack.encode(
+                        RestoreLocalCPUWorkerRetMsg(
+                            worker_event_id=request.worker_event_id,
+                            worker_id=self.worker_id,
+                            entries=int(result["entries"]),
+                            tokens=int(result["tokens"]),
+                            bytes=int(result["bytes"]),
+                            digest=str(result["digest"]),
+                            missing_event_metadata=int(
+                                result.get("missing_event_metadata", 0)
+                            ),
+                        )
                     )
                 elif isinstance(request, HealthWorkerMsg):
                     error_code = self.lmcache_engine.health()

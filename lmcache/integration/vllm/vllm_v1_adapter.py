@@ -94,6 +94,40 @@ _REQ_STATS_BY_ID: dict[str, dict[str, Any]] = {}
 _REQ_STATS_CUM: dict[str, int] = {"total": 0, "gpu": 0}
 
 
+def _prefix_fingerprint(token_ids: list[int]) -> str:
+    """Return the benchmark-only fingerprint shared with Dynamo offload logs."""
+    fingerprint = 0xCBF29CE484222325
+    prime = 0x100000001B3
+    for token in token_ids:
+        value = int(token) & 0xFFFFFFFF
+        for shift in (0, 8, 16, 24):
+            fingerprint ^= (value >> shift) & 0xFF
+            fingerprint = (fingerprint * prime) & 0xFFFFFFFFFFFFFFFF
+    return f"{fingerprint:016x}"
+
+
+def _request_prefix_observability_ids(
+    request: Any, block_size: int, max_chunks: int = 16
+) -> str:
+    """Encode complete request prefixes for exact offload/reuse joins."""
+    if block_size <= 0:
+        return "none"
+    token_ids = getattr(request, "all_token_ids", None)
+    if token_ids is None:
+        token_ids = getattr(request, "prompt_token_ids", None)
+    if token_ids is None:
+        return "none"
+    try:
+        tokens = [int(token) for token in token_ids]
+    except (TypeError, ValueError):
+        return "none"
+    chunk_count = min(max_chunks, len(tokens) // block_size)
+    return ",".join(
+        f"{count}:{_prefix_fingerprint(tokens[:count * block_size])}"
+        for count in range(1, chunk_count + 1)
+    ) or "none"
+
+
 def _rs_get(req_id: str) -> dict[str, Any]:
     with _REQ_STATS_LOCK:
         d = _REQ_STATS_BY_ID.get(req_id)
@@ -1974,11 +2008,17 @@ class LMCacheConnectorV1Impl:
             for tname in self._enabled_tiers:
                 rate_parts.append(f"{tname}={float(cum_rates.get(tname, 0.0))*100.0:.1f}%")
 
+            prefix_ids = _request_prefix_observability_ids(
+                request,
+                int(getattr(self, "_lmcache_chunk_size", 0) or getattr(self, "_block_size", 0)),
+            )
+
             logger.info(
-                "LMCache(vLLM) req_done: req=%s tok=%d %s | cum_hit_rate: %s",
+                "LMCache(vLLM) req_done: req=%s tok=%d %s prefix_ids=%s | cum_hit_rate: %s",
                 rid,
                 total,
                 " ".join(token_parts),
+                prefix_ids,
                 " ".join(rate_parts),
             )
 

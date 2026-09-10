@@ -18,6 +18,14 @@ from lmcache.v1.cache_controller.message import (  # noqa: E501
     ClearMsg,
     ClearRetMsg,
     ClearWorkerMsg,
+    RestoreLocalCPUWorkerMsg,
+    RestoreLocalCPUWorkerRetMsg,
+    RestoreLocalCPUMsg,
+    RestoreLocalCPURetMsg,
+    SnapshotLocalCPUWorkerMsg,
+    SnapshotLocalCPUWorkerRetMsg,
+    SnapshotLocalCPUMsg,
+    SnapshotLocalCPURetMsg,
     CompressMsg,
     CompressRetMsg,
     CompressWorkerMsg,
@@ -106,6 +114,7 @@ class LMCacheClusterExecutor:
                 ClearWorkerMsg(
                     worker_event_id=worker_event_id,
                     location=location,
+                    keep_fraction=msg.keep_fraction,
                 )
             )
             serialized_msgs.append(serialized_msg)
@@ -120,11 +129,115 @@ class LMCacheClusterExecutor:
             num_tokens_list.append(result.num_tokens)
 
         # TODO(Jiayi): Need to ensure cache consistency across workers.
-        assert len(set(num_tokens_list)) == 1, (
-            "The number of tokens cleared should be the same across all workers."
-        )
+        if len(set(num_tokens_list)) != 1:
+            # A partial CXL clear is selected independently from each worker's
+            # process-local metadata.  The physical shared pool is still
+            # cleared correctly, but the number of entries/tokens selected by
+            # each worker need not be identical.
+            if location == "CxlBackend" and msg.keep_fraction is not None:
+                logger.warning(
+                    "Partial CXL clear returned different per-worker counts: %s",
+                    num_tokens_list,
+                )
+            else:
+                raise AssertionError(
+                    "The number of tokens cleared should be the same across all workers."
+                )
 
         return ClearRetMsg(event_id=msg.event_id, num_tokens=num_tokens_list[0])
+
+    async def snapshot_local_cpu(
+        self, msg: SnapshotLocalCPUMsg
+    ) -> Union[SnapshotLocalCPURetMsg, ErrorMsg]:
+        """Snapshot every TP worker's process-local LocalCPU cache."""
+        worker_ids = self.reg_controller.get_workers(msg.instance_id)
+        assert worker_ids is not None
+        sockets = []
+        serialized_msgs = []
+        for worker_id in worker_ids:
+            socket = self.reg_controller.get_socket(msg.instance_id, worker_id)
+            if socket is None:
+                return ErrorMsg(
+                    error=(
+                        f"Worker {worker_id} not registered for instance "
+                        f"{msg.instance_id}"
+                    )
+                )
+            sockets.append(socket)
+            worker_event_id = f"SnapshotLocalCPUWorker{worker_id}{msg.event_id}"
+            serialized_msgs.append(
+                msgspec.msgpack.encode(
+                    SnapshotLocalCPUWorkerMsg(
+                        worker_event_id=worker_event_id,
+                        path=f"{msg.directory}/worker{worker_id}.pt",
+                    )
+                )
+            )
+
+        serialized_results = await self.execute_workers(
+            sockets=sockets,
+            serialized_msgs=serialized_msgs,
+        )
+        worker_results = []
+        for serialized_result in serialized_results:
+            result = msgspec.msgpack.decode(serialized_result, type=Msg)
+            if isinstance(result, ErrorMsg):
+                return result
+            if not isinstance(result, SnapshotLocalCPUWorkerRetMsg):
+                return ErrorMsg(error=f"Unexpected LocalCPU snapshot result: {result}")
+            worker_results.append(result)
+        return SnapshotLocalCPURetMsg(
+            event_id=msg.event_id,
+            directory=msg.directory,
+            worker_results=worker_results,
+        )
+
+    async def restore_local_cpu(
+        self, msg: RestoreLocalCPUMsg
+    ) -> Union[RestoreLocalCPURetMsg, ErrorMsg]:
+        """Restore every TP worker's process-local LocalCPU cache."""
+        worker_ids = self.reg_controller.get_workers(msg.instance_id)
+        assert worker_ids is not None
+        sockets = []
+        serialized_msgs = []
+        for worker_id in worker_ids:
+            socket = self.reg_controller.get_socket(msg.instance_id, worker_id)
+            if socket is None:
+                return ErrorMsg(
+                    error=(
+                        f"Worker {worker_id} not registered for instance "
+                        f"{msg.instance_id}"
+                    )
+                )
+            sockets.append(socket)
+            worker_event_id = f"RestoreLocalCPUWorker{worker_id}{msg.event_id}"
+            serialized_msgs.append(
+                msgspec.msgpack.encode(
+                    RestoreLocalCPUWorkerMsg(
+                        worker_event_id=worker_event_id,
+                        path=f"{msg.directory}/worker{worker_id}.pt",
+                        clear_existing=msg.clear_existing,
+                    )
+                )
+            )
+
+        serialized_results = await self.execute_workers(
+            sockets=sockets,
+            serialized_msgs=serialized_msgs,
+        )
+        worker_results = []
+        for serialized_result in serialized_results:
+            result = msgspec.msgpack.decode(serialized_result, type=Msg)
+            if isinstance(result, ErrorMsg):
+                return result
+            if not isinstance(result, RestoreLocalCPUWorkerRetMsg):
+                return ErrorMsg(error=f"Unexpected LocalCPU restore result: {result}")
+            worker_results.append(result)
+        return RestoreLocalCPURetMsg(
+            event_id=msg.event_id,
+            directory=msg.directory,
+            worker_results=worker_results,
+        )
 
     async def pin(self, msg: PinMsg) -> Union[PinRetMsg, ErrorMsg]:
         """

@@ -13,7 +13,10 @@ import zmq
 # First Party
 from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
-from lmcache.v1.cache_engine import LMCacheEngine
+from lmcache.v1.cache_engine import (
+    LMCacheEngine,
+    _add_cxl_prefetch_key_offset,
+)
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 from lmcache.v1.rpc_utils import (
@@ -178,12 +181,22 @@ class LMCacheLookupClient(LookupClientInterface):
         num_computed_tokens: int = 0,
     ) -> Optional[int]:
         lookup_id_buf = lookup_id.encode("utf-8")
+        aligned_computed_tokens = num_computed_tokens  # pre-aligned in adapter
+        chunk_size = getattr(self.token_database, "chunk_size", None)
+        key_offset = (
+            aligned_computed_tokens // int(chunk_size)
+            if chunk_size is not None and int(chunk_size) > 0
+            else 0
+        )
+        request_configs = _add_cxl_prefetch_key_offset(
+            request_configs,
+            key_offset,
+        )
         request_configs_str = ""
         if request_configs is not None and len(request_configs) != 0:
             request_configs_str = json.dumps(request_configs)
         request_configs_buf = request_configs_str.encode("utf-8")
         num_computed_buf = num_computed_tokens.to_bytes(8, "big", signed=False)
-        aligned_computed_tokens = num_computed_tokens  # pre-aligned in adapter
 
         # NOTE(Jiayi): We cannot only send hashes when blending enabled
         # because the blender need the input embedding.

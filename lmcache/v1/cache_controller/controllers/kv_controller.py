@@ -11,6 +11,8 @@ from lmcache.v1.cache_controller.message import (
     CheckFinishRetMsg,
     ClearMsg,
     ClearRetMsg,
+    RestoreLocalCPUMsg,
+    RestoreLocalCPURetMsg,
     CompressMsg,
     CompressRetMsg,
     DecompressMsg,
@@ -32,6 +34,8 @@ from lmcache.v1.cache_controller.message import (
     OffloadRetMsg,
     PinMsg,
     PinRetMsg,
+    SnapshotLocalCPUMsg,
+    SnapshotLocalCPURetMsg,
 )
 from lmcache.v1.cache_controller.observability import PrometheusLogger
 from lmcache.v1.cache_controller.utils import RegistryTree
@@ -127,6 +131,20 @@ class KVController:
         """
         assert self.cluster_executor is not None
         return await self.cluster_executor.execute("clear", msg)
+
+    async def snapshot_local_cpu(
+        self, msg: SnapshotLocalCPUMsg
+    ) -> SnapshotLocalCPURetMsg:
+        """Snapshot process-local LocalCPU state from every TP worker."""
+        assert self.cluster_executor is not None
+        return await self.cluster_executor.execute("snapshot_local_cpu", msg)
+
+    async def restore_local_cpu(
+        self, msg: RestoreLocalCPUMsg
+    ) -> RestoreLocalCPURetMsg:
+        """Restore process-local LocalCPU state on every TP worker."""
+        assert self.cluster_executor is not None
+        return await self.cluster_executor.execute("restore_local_cpu", msg)
 
     async def pin(self, msg: PinMsg) -> PinRetMsg:
         """

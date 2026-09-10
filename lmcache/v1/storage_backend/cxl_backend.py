@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, List, Optional, Seque
 import asyncio
 import ctypes
 import itertools
+import math
 import os
 import queue
 import re
@@ -43,6 +44,7 @@ from lmcache.v1.storage_backend.cache_policy import get_cache_policy
 from lmcache.v1.storage_backend.cxl_resource_governor import (
     CxlResourceGovernor,
     CxlResourceSnapshot,
+    CxlSharedResourceSnapshot,
     CxlSharedResourceLock,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
@@ -61,7 +63,7 @@ def _with_cxl_priority(method: Callable[..., Any]) -> Callable[..., Any]:
 
     @wraps(method)
     def wrapped(self: "CxlBackend", *args: Any, **kwargs: Any) -> Any:
-        with self._cxl_access():
+        with self._cxl_access(operation=method.__name__):
             return method(self, *args, **kwargs)
 
     return wrapped
@@ -72,9 +74,41 @@ def _with_background_cxl_priority(method: Callable[..., Any]) -> Callable[..., A
 
     @wraps(method)
     def wrapped(self: "CxlBackend", *args: Any, **kwargs: Any) -> Any:
-        with self.background_offload_slot() as admitted:
+        with self.background_offload_slot(operation=method.__name__) as admitted:
             if not admitted:
-                self._prefetch_status.reason = "cxl_resource_busy"
+                reason = getattr(self._prefetch_status, "reason", None)
+                if not isinstance(reason, str):
+                    reason = "cxl_resource_busy"
+                    self._prefetch_status.reason = reason
+                if os.environ.get("LMCACHE_CXL_RESOURCE_TRACE", "").lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }:
+                    local = self.cxl_resource_snapshot()
+                    shared = self.cxl_shared_resource_snapshot()
+                    logger.info(
+                        "CXL_PREFETCH_RESOURCE_DENIED operation=%s reason=%s "
+                        "pid=%s local_serving_active=%d local_serving_waiting=%d "
+                        "local_background_active=%s local_background_admitted=%d "
+                        "local_background_deferred=%d local_serving_waited=%d "
+                        "shared_background_admitted=%d shared_background_deferred=%d "
+                        "shared_serving_lock_waited=%d shared_lock_enabled=%s",
+                        method.__name__,
+                        reason,
+                        os.getpid(),
+                        local.serving_active,
+                        local.serving_waiting,
+                        local.background_active,
+                        local.background_admitted,
+                        local.background_deferred,
+                        local.serving_waited,
+                        shared.background_admitted,
+                        shared.background_deferred,
+                        shared.serving_lock_waited,
+                        self.cxl_shared_resource_lock.enabled,
+                    )
                 return False
             return method(self, *args, **kwargs)
 
@@ -494,7 +528,7 @@ class CxlBackend(StorageBackendInterface):
         return "CxlBackend"
 
     @contextmanager
-    def _cxl_access(self) -> Iterator[None]:
+    def _cxl_access(self, operation: str = "unknown") -> Iterator[None]:
         """Enter CXL access with serving priority.
 
         ``background_offload_slot`` marks the current executor thread after it
@@ -506,12 +540,14 @@ class CxlBackend(StorageBackendInterface):
         if getattr(self._cxl_resource_context, "background", False):
             yield
             return
-        with self.cxl_resource_governor.serving():
-            with self.cxl_shared_resource_lock.serving():
+        with self.cxl_resource_governor.serving(operation=operation):
+            with self.cxl_shared_resource_lock.serving(operation=operation):
                 yield
 
     @contextmanager
-    def background_offload_slot(self) -> Iterator[bool]:
+    def background_offload_slot(
+        self, operation: str = "offload_to_backend"
+    ) -> Iterator[bool]:
         """Try to reserve CXL for one bounded background offload chunk.
 
         The context manager is intentionally non-blocking.  Callers should
@@ -520,13 +556,19 @@ class CxlBackend(StorageBackendInterface):
         writes; normal ``submit_put_task`` calls remain serving-priority.
         """
 
-        with self.cxl_resource_governor.try_background() as local_admitted:
+        with self.cxl_resource_governor.try_background(
+            operation=operation
+        ) as local_admitted:
             if not local_admitted:
+                self._prefetch_status.reason = "cxl_resource_busy_local"
                 yield False
                 return
 
-            with self.cxl_shared_resource_lock.try_background() as admitted:
+            with self.cxl_shared_resource_lock.try_background(
+                operation=operation
+            ) as admitted:
                 if not admitted:
+                    self._prefetch_status.reason = "cxl_resource_busy_shared"
                     yield False
                     return
 
@@ -541,6 +583,11 @@ class CxlBackend(StorageBackendInterface):
         """Return local serving/background arbitration counters."""
 
         return self.cxl_resource_governor.snapshot()
+
+    def cxl_shared_resource_snapshot(self) -> CxlSharedResourceSnapshot:
+        """Return process-shared CXL lock wait/admission counters."""
+
+        return self.cxl_shared_resource_lock.snapshot()
 
     def set_kv_event_sink(
         self, sink: Callable[[CacheStoreEvent | CacheRemoveEvent], None]
@@ -903,6 +950,70 @@ class CxlBackend(StorageBackendInterface):
                     self.cxl_shm.close(hnd)
                 except Exception:
                     pass
+
+    @_with_cxl_priority
+    def clear(self, keep_fraction: float = 0.0) -> int:
+        """Remove CXL entries while optionally retaining the newest fraction.
+
+        This is an administrative/test operation, not a shared-pool reset.  It
+        destroys individual native objects through the normal remove path, so
+        other processes remain attached to the mapping and receive the normal
+        CXL eviction events.  The selection is made from this process's
+        metadata (oldest first under the configured cache policy); shared CXL
+        entries discovered by this process are included in that selection.
+
+        ``keep_fraction=0`` is a full logical clear.  A value of ``0.1`` keeps
+        the newest 10% of this worker's tracked entries and removes the rest.
+        Pinned entries are left in place rather than being destroyed under an
+        active lookup.
+        """
+        try:
+            keep_fraction = float(keep_fraction)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("CXL keep_fraction must be a number in [0, 1]") from exc
+        if not 0.0 <= keep_fraction <= 1.0:
+            raise ValueError("CXL keep_fraction must be a number in [0, 1]")
+
+        with self.cxl_lock:
+            ordered_keys = list(self.dict.keys())
+
+        keep_count = min(len(ordered_keys), math.ceil(len(ordered_keys) * keep_fraction))
+        remove_keys = ordered_keys[: len(ordered_keys) - keep_count]
+        removed_tokens = 0
+        removed_entries = 0
+        skipped_pinned = 0
+        for key in remove_keys:
+            with self.cxl_lock:
+                meta = self.dict.get(key)
+                if meta is not None and not meta.can_evict:
+                    skipped_pinned += 1
+                    continue
+                shape = getattr(meta, "shape", None)
+                fmt = getattr(meta, "fmt", None)
+            if self.remove(key, force=True):
+                removed_entries += 1
+                try:
+                    if shape is not None and fmt is not None:
+                        token_dim = fmt.token_dim()
+                        if token_dim < len(shape):
+                            removed_tokens += int(shape[token_dim])
+                except Exception:
+                    # The clear result is informational; native removal has
+                    # already succeeded even if an unusual format has no
+                    # usable token dimension.
+                    pass
+
+        logger.info(
+            "CXL administrative clear: tracked=%d keep_fraction=%.3f "
+            "kept=%d removed=%d removed_tokens=%d skipped_pinned=%d",
+            len(ordered_keys),
+            keep_fraction,
+            keep_count,
+            removed_entries,
+            removed_tokens,
+            skipped_pinned,
+        )
+        return removed_tokens
 
     def insert_key(
         self,
@@ -1731,6 +1842,41 @@ class CxlBackend(StorageBackendInterface):
         )
 
     def close(self) -> None:
+        resource_snapshot = self.cxl_resource_snapshot()
+        shared_resource_snapshot = self.cxl_shared_resource_snapshot()
+        logger.info(
+            "CXL_RESOURCE_SUMMARY pid=%s "
+            "local_serving_waited=%d local_serving_wait_ms_total=%.3f "
+            "local_serving_wait_ms_max=%.3f local_serving_wait_by_operation=%s "
+            "local_background_admitted=%d local_background_deferred=%d "
+            "local_background_active_ms_total=%.3f "
+            "local_background_active_ms_max=%.3f "
+            "shared_serving_lock_waited=%d "
+            "shared_serving_lock_wait_ms_total=%.3f "
+            "shared_serving_lock_wait_ms_max=%.3f "
+            "shared_serving_lock_wait_by_operation=%s "
+            "shared_background_admitted=%d shared_background_deferred=%d "
+            "shared_background_active_ms_total=%.3f "
+            "shared_background_active_ms_max=%.3f",
+            os.getpid(),
+            resource_snapshot.serving_waited,
+            resource_snapshot.serving_wait_ms_total,
+            resource_snapshot.serving_wait_ms_max,
+            resource_snapshot.serving_wait_by_operation,
+            resource_snapshot.background_admitted,
+            resource_snapshot.background_deferred,
+            resource_snapshot.background_active_ms_total,
+            resource_snapshot.background_active_ms_max,
+            shared_resource_snapshot.serving_lock_waited,
+            shared_resource_snapshot.serving_lock_wait_ms_total,
+            shared_resource_snapshot.serving_lock_wait_ms_max,
+            shared_resource_snapshot.serving_lock_wait_by_operation,
+            shared_resource_snapshot.background_admitted,
+            shared_resource_snapshot.background_deferred,
+            shared_resource_snapshot.background_active_ms_total,
+            shared_resource_snapshot.background_active_ms_max,
+        )
+
         # Close all handles
         with self.cxl_lock:
             for key, hnd in list(self.key_handles.items()):

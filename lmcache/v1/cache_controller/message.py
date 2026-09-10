@@ -192,9 +192,33 @@ class ClearWorkerMsg(ControlMsg):
 
     worker_event_id: str
     location: str
+    # For CxlBackend, retain this fraction of the local CXL metadata entries
+    # and remove the rest.  None preserves the historical full-clear behavior.
+    keep_fraction: Optional[float] = None
 
     def describe(self) -> str:
         return f"Clear tokens in location {self.location}"
+
+
+class SnapshotLocalCPUWorkerMsg(ControlMsg):
+    """Persist one worker's LocalCPU cache to a host-local file."""
+
+    worker_event_id: str
+    path: str
+
+    def describe(self) -> str:
+        return f"Snapshot LocalCPU cache to {self.path}"
+
+
+class RestoreLocalCPUWorkerMsg(ControlMsg):
+    """Restore one worker's LocalCPU cache from a host-local file."""
+
+    worker_event_id: str
+    path: str
+    clear_existing: bool = True
+
+    def describe(self) -> str:
+        return f"Restore LocalCPU cache from {self.path}"
 
 
 class PinWorkerMsg(ControlMsg):
@@ -374,6 +398,35 @@ class ClearWorkerRetMsg(ControlRetMsg):
         return f"Number of cleared tokens: {self.num_tokens}"
 
 
+class SnapshotLocalCPUWorkerRetMsg(ControlRetMsg):
+    """Result of a LocalCPU snapshot operation."""
+
+    worker_event_id: str
+    worker_id: int
+    entries: int
+    tokens: int
+    bytes: int
+    digest: str
+
+    def describe(self) -> str:
+        return f"Snapshot LocalCPU worker {self.worker_id}: {self.entries} entries"
+
+
+class RestoreLocalCPUWorkerRetMsg(ControlRetMsg):
+    """Result of a LocalCPU restore operation."""
+
+    worker_event_id: str
+    worker_id: int
+    entries: int
+    tokens: int
+    bytes: int
+    digest: str
+    missing_event_metadata: int = 0
+
+    def describe(self) -> str:
+        return f"Restore LocalCPU worker {self.worker_id}: {self.entries} entries"
+
+
 class PinWorkerRetMsg(ControlRetMsg):
     """Pin return message for a single lmcache worker"""
 
@@ -528,11 +581,37 @@ class ClearMsg(OrchMsg):
     event_id: str
     instance_id: str
     location: str
+    # Only meaningful for a CxlBackend clear.  It is intentionally optional so
+    # existing controller clients retain their original semantics.
+    keep_fraction: Optional[float] = None
 
     def describe(self) -> str:
         return (
             f"Clear tokens in instance {self.instance_id} and locations {self.location}"
         )
+
+
+class SnapshotLocalCPUMsg(OrchMsg):
+    """Snapshot all TP workers' process-local LocalCPU caches."""
+
+    event_id: str
+    instance_id: str
+    directory: str
+
+    def describe(self) -> str:
+        return f"Snapshot LocalCPU cache for instance {self.instance_id}"
+
+
+class RestoreLocalCPUMsg(OrchMsg):
+    """Restore all TP workers' process-local LocalCPU caches."""
+
+    event_id: str
+    instance_id: str
+    directory: str
+    clear_existing: bool = True
+
+    def describe(self) -> str:
+        return f"Restore LocalCPU cache for instance {self.instance_id}"
 
 
 class PinMsg(OrchMsg):
@@ -736,6 +815,28 @@ class ClearRetMsg(OrchRetMsg):
         return f"Number of cleared tokens: {self.num_tokens}"
 
 
+class SnapshotLocalCPURetMsg(OrchRetMsg):
+    """Return statistics for a LocalCPU snapshot across TP workers."""
+
+    event_id: str
+    directory: str
+    worker_results: list[SnapshotLocalCPUWorkerRetMsg]
+
+    def describe(self) -> str:
+        return f"Snapshot LocalCPU cache in {self.directory}"
+
+
+class RestoreLocalCPURetMsg(OrchRetMsg):
+    """Return statistics for a LocalCPU restore across TP workers."""
+
+    event_id: str
+    directory: str
+    worker_results: list[RestoreLocalCPUWorkerRetMsg]
+
+    def describe(self) -> str:
+        return f"Restore LocalCPU cache from {self.directory}"
+
+
 class PinRetMsg(OrchRetMsg):
     """Pin return message"""
 
@@ -851,6 +952,10 @@ Msg = Union[
     BatchedKVOperationMsg,
     ClearWorkerMsg,
     ClearWorkerRetMsg,
+    SnapshotLocalCPUWorkerMsg,
+    SnapshotLocalCPUWorkerRetMsg,
+    RestoreLocalCPUWorkerMsg,
+    RestoreLocalCPUWorkerRetMsg,
     PinWorkerMsg,
     PinWorkerRetMsg,
     CompressWorkerMsg,
@@ -879,6 +984,8 @@ Msg = Union[
     LookupRetMsg,
     ClearMsg,
     ClearRetMsg,
+    SnapshotLocalCPUMsg,
+    RestoreLocalCPUMsg,
     PinMsg,
     PinRetMsg,
     CompressMsg,

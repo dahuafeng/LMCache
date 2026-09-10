@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Worker-side callable for Dynamo's waiting-route CXL prefetch hint."""
+"""Worker-side callable for Dynamo's route-time CXL prefetch hint."""
 
 from __future__ import annotations
 
@@ -82,7 +82,7 @@ def cxl_prefetch(
                 # Statistics are diagnostic only and must not turn a
                 # best-effort prefetch admission into a failed RPC.
                 logger.debug(
-                    "Unable to read CXL lookahead promotion stats for request %s: %s",
+                    "Unable to read route-time CXL promotion stats for request %s: %s",
                     request_id,
                     exc,
                 )
@@ -99,7 +99,7 @@ def cxl_prefetch(
         return result
     except Exception as exc:
         logger.debug(
-            "CXL lookahead promotion failed open for request %s: %s",
+            "Route-time CXL promotion failed open for request %s: %s",
             request_id,
             exc,
         )

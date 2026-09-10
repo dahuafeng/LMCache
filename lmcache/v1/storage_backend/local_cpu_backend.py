@@ -2,8 +2,11 @@
 # Standard
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Union
+import hashlib
+import os
 import threading
 import time
+from pathlib import Path
 
 # Third Party
 import torch
@@ -18,6 +21,7 @@ from lmcache.utils import (
     CacheRemoveEvent,
     CacheStoreEvent,
     _lmcache_nvtx_annotate,
+    parse_cache_key,
 )
 from lmcache.v1.cache_controller.message import OpType
 from lmcache.v1.config import LMCacheEngineConfig
@@ -883,6 +887,240 @@ class LocalCPUBackend(AllocatorBackendInterface):
         """
         with self.cpu_lock:
             return list(self.hot_cache.keys())
+
+    @staticmethod
+    def _snapshot_digest_update(
+        digest: "hashlib._Hash",
+        key: CacheEngineKey,
+        tensor: torch.Tensor,
+        fmt: MemoryFormat,
+        pin_count: int,
+        is_prefetch: bool,
+        access_count: int,
+    ) -> None:
+        """Add stable cache identity and contents to a LocalCPU digest."""
+        digest.update(
+            (
+                f"{key.to_string()}|{fmt.value}|{pin_count}|{int(is_prefetch)}|"
+                f"{access_count}|{tuple(tensor.shape)}|{tensor.dtype}\n"
+            ).encode("utf-8")
+        )
+        raw = tensor.detach().contiguous().view(torch.uint8)
+        digest.update(raw.numpy().tobytes())
+
+    def snapshot(
+        self,
+        path: str,
+        event_metadata: Optional[
+            dict[int, tuple[Optional[int], list[int], Optional[int], Optional[int]]]
+        ] = None,
+    ) -> dict[str, Any]:
+        """Persist the allocator-owned LocalCPU cache without evicting it.
+
+        The file contains logical cache objects rather than allocator addresses;
+        restore allocates fresh objects from the destination worker's allocator
+        and copies the tensor bytes into them.  Objects are temporarily
+        reference-counted while their tensors are copied, so taking a snapshot
+        is safe against concurrent eviction.
+        """
+        snapshot_path = Path(path)
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        held: list[tuple[CacheEngineKey, MemoryObj, dict[str, Any], int]] = []
+        policy_access = getattr(self.cache_policy, "get_access_count", None)
+
+        with self.cpu_lock:
+            for key, memory_obj in self.hot_cache.items():
+                memory_obj.ref_count_up()
+                access_count = (
+                    int(policy_access(key)) if callable(policy_access) else 0
+                )
+                held.append(
+                    (
+                        key,
+                        memory_obj,
+                        {
+                            "pin_count": int(memory_obj.meta.pin_count),
+                            "is_prefetch": key in self.prefetch_keys,
+                            "prefetch_metadata": dict(
+                                self.prefetch_metadata.get(key, {})
+                            ),
+                        },
+                        access_count,
+                    )
+                )
+
+        entries: list[dict[str, Any]] = []
+        skipped: list[str] = []
+        digest = hashlib.sha256()
+        total_tokens = 0
+        total_bytes = 0
+        try:
+            for key, memory_obj, state, access_count in held:
+                tensor = memory_obj.tensor
+                if tensor is None:
+                    skipped.append(key.to_string())
+                    continue
+                tensor_copy = tensor.detach().contiguous().clone().cpu()
+                event = None
+                if event_metadata is not None:
+                    metadata = event_metadata.get(int(key.chunk_hash))
+                    if metadata is not None:
+                        parent, token_ids, block_size, lora_id = metadata
+                        event = {
+                            "parent_block_hash": parent,
+                            "token_ids": list(token_ids),
+                            "block_size": int(block_size or 0),
+                            "lora_id": lora_id,
+                        }
+                fmt = memory_obj.meta.fmt
+                self._snapshot_digest_update(
+                    digest,
+                    key,
+                    tensor_copy,
+                    fmt,
+                    state["pin_count"],
+                    state["is_prefetch"],
+                    access_count,
+                )
+                entries.append(
+                    {
+                        "key": key.to_string(),
+                        "tensor": tensor_copy,
+                        "fmt": int(fmt.value),
+                        "pin_count": state["pin_count"],
+                        "is_prefetch": state["is_prefetch"],
+                        "prefetch_metadata": state["prefetch_metadata"],
+                        "access_count": access_count,
+                        "event": event,
+                    }
+                )
+                total_tokens += int(memory_obj.get_num_tokens())
+                total_bytes += int(tensor_copy.numel() * tensor_copy.element_size())
+        finally:
+            for _, memory_obj, _, _ in held:
+                memory_obj.ref_count_down()
+
+        payload = {
+            "version": 1,
+            "backend": "LocalCPUBackend",
+            "entries": entries,
+            "skipped": skipped,
+            "digest": digest.hexdigest(),
+        }
+        temporary = snapshot_path.with_name(f".{snapshot_path.name}.tmp")
+        torch.save(payload, temporary)
+        os.replace(temporary, snapshot_path)
+        if skipped:
+            logger.warning(
+                "LocalCPU snapshot skipped %d objects without tensor data: %s",
+                len(skipped),
+                skipped[:4],
+            )
+        return {
+            "path": str(snapshot_path),
+            "entries": len(entries),
+            "skipped": len(skipped),
+            "tokens": total_tokens,
+            "bytes": total_bytes,
+            "digest": digest.hexdigest(),
+        }
+
+    def restore(self, path: str, clear_existing: bool = True) -> dict[str, Any]:
+        """Restore allocator-owned LocalCPU objects from :meth:`snapshot`."""
+        if clear_existing:
+            self.clear()
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+        except TypeError:  # older torch versions lack ``weights_only``
+            payload = torch.load(path, map_location="cpu")
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            raise ValueError(f"Unsupported LocalCPU snapshot: {path}")
+
+        entries = payload.get("entries", [])
+        digest = hashlib.sha256()
+        restored: list[dict[str, Any]] = []
+        total_tokens = 0
+        total_bytes = 0
+        missing_event_metadata = 0
+        policy_access = getattr(self.cache_policy, "key_to_access_count", None)
+
+        for entry in entries:
+            key = parse_cache_key(entry["key"])
+            tensor = entry["tensor"]
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(f"LocalCPU snapshot entry has no tensor: {entry['key']}")
+            fmt = MemoryFormat(int(entry["fmt"]))
+            memory_obj = self.allocate(
+                tensor.shape,
+                tensor.dtype,
+                fmt=fmt,
+                eviction=False,
+                busy_loop=False,
+            )
+            if memory_obj is None or memory_obj.tensor is None:
+                raise RuntimeError(
+                    "LocalCPU restore ran out of destination capacity at "
+                    f"{entry['key']}"
+                )
+            memory_obj.tensor.copy_(tensor, non_blocking=False)
+            inserted = key not in self.hot_cache
+            if inserted:
+                self.submit_put_task(key, memory_obj)
+            memory_obj.ref_count_down()
+            if not inserted:
+                continue
+
+            with self.cpu_lock:
+                if entry.get("is_prefetch", False):
+                    self.prefetch_keys.add(key)
+                    self.prefetch_metadata[key] = dict(
+                        entry.get("prefetch_metadata") or {}
+                    )
+                if isinstance(policy_access, dict):
+                    policy_access[key] = int(entry.get("access_count", 0))
+                restored_obj = self.hot_cache[key]
+                pin_count = int(entry.get("pin_count", 0))
+                for _ in range(max(0, pin_count)):
+                    restored_obj.pin()
+
+            self._snapshot_digest_update(
+                digest,
+                key,
+                tensor,
+                fmt,
+                int(entry.get("pin_count", 0)),
+                bool(entry.get("is_prefetch", False)),
+                int(entry.get("access_count", 0)),
+            )
+            event = entry.get("event")
+            if event is None:
+                missing_event_metadata += 1
+            restored.append(
+                {
+                    "key": entry["key"],
+                    "chunk_hash": int(key.chunk_hash),
+                    "event": event,
+                }
+            )
+            total_tokens += int(tensor.shape[fmt.token_dim()])
+            total_bytes += int(tensor.numel() * tensor.element_size())
+
+        actual_digest = digest.hexdigest()
+        expected_digest = str(payload.get("digest", ""))
+        if expected_digest and actual_digest != expected_digest:
+            raise RuntimeError(
+                f"LocalCPU restore digest mismatch: expected {expected_digest}, "
+                f"got {actual_digest}"
+            )
+        return {
+            "path": str(path),
+            "entries": len(restored),
+            "tokens": total_tokens,
+            "bytes": total_bytes,
+            "digest": actual_digest,
+            "missing_event_metadata": missing_event_metadata,
+            "restored": restored,
+        }
 
     def clear(self) -> int:
         """

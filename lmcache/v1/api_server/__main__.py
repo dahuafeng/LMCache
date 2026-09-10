@@ -55,6 +55,10 @@ from lmcache.v1.cache_controller.message import (  # noqa: E501
     QueryInstRetMsg,
     QueryWorkerInfoMsg,
     QueryWorkerInfoRetMsg,
+    RestoreLocalCPUMsg,
+    RestoreLocalCPURetMsg,
+    SnapshotLocalCPUMsg,
+    SnapshotLocalCPURetMsg,
 )
 from lmcache.v1.cache_controller.utils import WorkerInfo
 from lmcache.v1.internal_api_server.api_registry import APIRegistry
@@ -182,6 +186,7 @@ def create_app(
     class ClearRequest(BaseModel):
         instance_id: str
         location: str
+        keep_fraction: Optional[float] = None
 
     class ClearResponse(BaseModel):
         event_id: str
@@ -195,6 +200,7 @@ def create_app(
                 event_id=event_id,
                 instance_id=req.instance_id,
                 location=req.location,
+                keep_fraction=req.keep_fraction,
             )
             ret_msg = await lmcache_controller_manager.handle_orchestration_message(msg)
             assert not isinstance(ret_msg, ErrorMsg), ret_msg.error
@@ -202,6 +208,89 @@ def create_app(
             return ClearResponse(
                 event_id=ret_msg.event_id, num_tokens=ret_msg.num_tokens
             )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e)) from e
+
+    class LocalCPUStateRequest(BaseModel):
+        instance_id: str
+        directory: str
+        clear_existing: bool = True
+
+    class LocalCPUWorkerStateResponse(BaseModel):
+        worker_id: int
+        entries: int
+        tokens: int
+        bytes: int
+        digest: str
+        missing_event_metadata: int = 0
+
+    class LocalCPUStateResponse(BaseModel):
+        event_id: str
+        directory: str
+        worker_results: List[LocalCPUWorkerStateResponse]
+
+    def _local_cpu_worker_result(result):
+        return LocalCPUWorkerStateResponse(
+            worker_id=result.worker_id,
+            entries=result.entries,
+            tokens=result.tokens,
+            bytes=result.bytes,
+            digest=result.digest,
+            missing_event_metadata=getattr(result, "missing_event_metadata", 0),
+        )
+
+    @app.post("/snapshot_local_cpu", response_model=LocalCPUStateResponse)
+    async def snapshot_local_cpu(req: LocalCPUStateRequest):
+        try:
+            event_id = "SnapshotLocalCPU" + str(uuid.uuid4())
+            ret_msg = await lmcache_controller_manager.handle_orchestration_message(
+                SnapshotLocalCPUMsg(
+                    event_id=event_id,
+                    instance_id=req.instance_id,
+                    directory=req.directory,
+                )
+            )
+            if isinstance(ret_msg, ErrorMsg):
+                raise HTTPException(status_code=500, detail=ret_msg.error)
+            assert isinstance(ret_msg, SnapshotLocalCPURetMsg)
+            return LocalCPUStateResponse(
+                event_id=ret_msg.event_id,
+                directory=ret_msg.directory,
+                worker_results=[
+                    _local_cpu_worker_result(result)
+                    for result in ret_msg.worker_results
+                ],
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e)) from e
+
+    @app.post("/restore_local_cpu", response_model=LocalCPUStateResponse)
+    async def restore_local_cpu(req: LocalCPUStateRequest):
+        try:
+            event_id = "RestoreLocalCPU" + str(uuid.uuid4())
+            ret_msg = await lmcache_controller_manager.handle_orchestration_message(
+                RestoreLocalCPUMsg(
+                    event_id=event_id,
+                    instance_id=req.instance_id,
+                    directory=req.directory,
+                    clear_existing=req.clear_existing,
+                )
+            )
+            if isinstance(ret_msg, ErrorMsg):
+                raise HTTPException(status_code=500, detail=ret_msg.error)
+            assert isinstance(ret_msg, RestoreLocalCPURetMsg)
+            return LocalCPUStateResponse(
+                event_id=ret_msg.event_id,
+                directory=ret_msg.directory,
+                worker_results=[
+                    _local_cpu_worker_result(result)
+                    for result in ret_msg.worker_results
+                ],
+            )
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e)) from e
 

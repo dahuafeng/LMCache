@@ -105,6 +105,25 @@ def test_sparse_reactive_prefetch_selects_only_requested_prefix_positions():
     assert selected == [all_keys[1], all_keys[3]]
 
 
+def test_sparse_reactive_prefetch_keeps_all_candidates_for_batching():
+    """The batch limit must not discard later candidate positions."""
+    cfg = LMCacheEngineConfig.from_legacy(
+        chunk_size=256, backend="cpu", save_unfull_chunk=False
+    )
+    db = ChunkedTokenDatabase(cfg, dumb_metadata())
+    tokens = list(range(4 * 256))
+    all_keys = [key for _, _, key in db.process_tokens(tokens=tokens)]
+
+    selected = _select_cxl_prefetch_keys(
+        db,
+        tokens,
+        max_chunks=2,
+        candidate_block_indices=[0, 1, 2, 3],
+    )
+
+    assert selected == all_keys
+
+
 @pytest.mark.parametrize("prefix_length", [0, 16, 64, 256])
 @pytest.mark.parametrize("chunk_lengths", [[256, 512, 256], [1024, 512, 256]])
 @pytest.mark.skipif(

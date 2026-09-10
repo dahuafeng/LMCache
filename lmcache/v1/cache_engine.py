@@ -72,6 +72,33 @@ ProcessedChunk = Tuple[CacheEngineKey, MemoryObj, int, int]
 # (list of processed chunks, total kv size)
 ProcessTokensInternalResult = Tuple[List[ProcessedChunk], int]
 
+# Request-scoped route hints are forwarded through LMCache's existing
+# request_configs path. Keeping the key here avoids coupling Dynamo to
+# LMCache's internal CacheEngineKey representation.
+CXL_PREFETCH_HINT_CONFIG_KEY = "lmcache.cxl_prefetch_hint"
+# Maximum number of candidate positions accepted from one serialized route
+# hint.  This is a safety bound on the hint itself; ``max_chunks`` in the hint
+# is the number of keys submitted to StorageManager per batch, not the total
+# number of eligible chunks in the request.
+CXL_PREFETCH_HINT_MAX_CANDIDATES = 64
+CXL_PREFETCH_HINT_MAX_CHUNKS = 64
+
+
+def _add_cxl_prefetch_key_offset(
+    request_configs: Optional[dict], key_offset: int
+) -> Optional[dict]:
+    """Copy a route hint when a lookup client omitted leading GPU chunks."""
+    if key_offset <= 0 or not isinstance(request_configs, dict):
+        return request_configs
+    hint = request_configs.get(CXL_PREFETCH_HINT_CONFIG_KEY)
+    if not isinstance(hint, dict):
+        return request_configs
+    updated_hint = dict(hint)
+    updated_hint["key_offset"] = key_offset
+    updated_configs = dict(request_configs)
+    updated_configs[CXL_PREFETCH_HINT_CONFIG_KEY] = updated_hint
+    return updated_configs
+
 
 def _select_cxl_prefetch_keys(
     token_database: TokenDatabase,
@@ -89,19 +116,22 @@ def _select_cxl_prefetch_keys(
     if max_chunks <= 0:
         return []
 
-    requested_indices = (
-        None
-        if candidate_block_indices is None
-        else {max(0, int(index)) for index in candidate_block_indices}
-    )
+    if candidate_block_indices is None:
+        requested_indices = None
+    else:
+        requested_indices: set[int] = set()
+        for raw_index in candidate_block_indices:
+            requested_indices.add(max(0, int(raw_index)))
+            if len(requested_indices) >= CXL_PREFETCH_HINT_MAX_CANDIDATES:
+                break
     if requested_indices is not None and not requested_indices:
         return []
 
-    target_count = (
-        max_chunks
-        if requested_indices is None
-        else min(len(requested_indices), max_chunks)
-    )
+    # For a route-carried hint, ``max_chunks`` is a per-batch limit.  Keep all
+    # requested candidate positions so the caller can submit the complete
+    # request in bounded batches.  Preserve the legacy contiguous-front
+    # behavior when no sparse candidate list is supplied.
+    target_count = max_chunks if requested_indices is None else len(requested_indices)
     keys: list[CacheEngineKey] = []
     for chunk_index, (_, _, key) in enumerate(
         token_database.process_tokens(tokens=tokens, mask=None)
@@ -1134,6 +1164,85 @@ class LMCacheEngine:
         logger.debug(f"Stored {tot_token_num} out of total {len(tokens)} tokens")
         yield
 
+    def _submit_cxl_prefetch_in_batches(
+        self,
+        keys: Sequence[CacheEngineKey],
+        *,
+        batch_chunks: int,
+        request_id: Optional[str],
+    ) -> dict[str, int | bool | str | None]:
+        """Submit all eligible keys in bounded StorageManager batches.
+
+        ``batch_chunks`` limits one admission call only.  It deliberately does
+        not limit the number of candidate keys belonging to the request.  The
+        StorageManager pending queue remains the global backpressure boundary;
+        a later batch can still be rejected when that queue is full.
+        """
+        if self.storage_manager is None or batch_chunks <= 0 or not keys:
+            return {
+                "enabled": False,
+                "requested": len(keys),
+                "batches": 0,
+                "scheduled": 0,
+                "queued": 0,
+                "deduplicated": 0,
+                "already_cpu": 0,
+                "capacity_rejected": 0,
+                "queue_rejected": 0,
+                "status": "unavailable",
+            }
+
+        # Respect the worker-local hard cap even if a route hint came from a
+        # process using a larger batch setting.  Test doubles and older
+        # StorageManager wrappers need not expose this attribute.
+        worker_limit = getattr(
+            self.storage_manager, "cxl_prefetch_max_chunks", batch_chunks
+        )
+        try:
+            worker_limit = max(1, int(worker_limit))
+        except (TypeError, ValueError):
+            worker_limit = batch_chunks
+        batch_size = min(max(1, int(batch_chunks)), CXL_PREFETCH_HINT_MAX_CHUNKS)
+        batch_size = min(batch_size, worker_limit)
+
+        aggregate: dict[str, int | bool | str | None] = {
+            "enabled": True,
+            "requested": len(keys),
+            "batches": 0,
+            "scheduled": 0,
+            "queued": 0,
+            "deduplicated": 0,
+            "already_cpu": 0,
+            "capacity_rejected": 0,
+            "queue_rejected": 0,
+            "status": "accepted",
+        }
+        numeric_fields = (
+            "scheduled",
+            "queued",
+            "deduplicated",
+            "already_cpu",
+            "capacity_rejected",
+            "queue_rejected",
+        )
+        for start in range(0, len(keys), batch_size):
+            batch = list(keys[start : start + batch_size])
+            result = self.storage_manager.submit_cxl_prefetch(
+                batch,
+                max_chunks=len(batch),
+                request_id=request_id,
+            )
+            aggregate["batches"] = int(aggregate["batches"]) + 1
+            for field in numeric_fields:
+                aggregate[field] = int(aggregate[field]) + int(
+                    result.get(field, 0)
+                )
+            status = result.get("status")
+            if status not in (None, "accepted"):
+                aggregate["status"] = status
+
+        return aggregate
+
     def submit_cxl_prefetch(
         self,
         request_id: str,
@@ -1141,19 +1250,23 @@ class LMCacheEngine:
         max_chunks: int,
         candidate_block_indices: Optional[Iterable[int]] = None,
     ) -> dict[str, int | bool | str | None]:
-        """Translate logical tokens and submit a bounded reactive hint.
+        """Translate logical tokens and submit all candidates in bounded batches.
 
         Dynamo never constructs LMCache keys.  The local TokenDatabase keeps
         chunk size, hash configuration, model namespace, dtype, and TP-rank
-        semantics on the LMCache side where they belong.
+        semantics on the LMCache side where they belong.  When sparse candidate
+        indices are supplied, ``max_chunks`` limits each StorageManager batch;
+        it does not discard later eligible candidates from this request.
         """
         if self.storage_manager is None or max_chunks <= 0:
             return {
                 "enabled": False,
                 "scheduled": 0,
+                "queued": 0,
                 "deduplicated": 0,
                 "already_cpu": 0,
                 "capacity_rejected": 0,
+                "queue_rejected": 0,
                 "status": "unavailable",
             }
 
@@ -1164,11 +1277,92 @@ class LMCacheEngine:
             candidate_block_indices,
         )
 
-        return self.storage_manager.submit_cxl_prefetch(
+        return self._submit_cxl_prefetch_in_batches(
             keys,
-            max_chunks=max_chunks,
+            batch_chunks=max_chunks,
             request_id=request_id,
         )
+
+    def _submit_cxl_prefetch_hint(
+        self,
+        lookup_id: Optional[str],
+        keys: Sequence[CacheEngineKey],
+        request_configs: Optional[dict],
+        key_offset: int = 0,
+    ) -> None:
+        """Register a route-carried CXL promotion before normal lookup.
+
+        The scheduler-side connector sends this metadata in the same lookup
+        message as the cache keys. Registering here, before any backend
+        contains/get operation, closes the old side-channel race where demand
+        could fall through to CXL before the route-time promotion Future
+        existed. Admission remains best-effort and non-blocking.
+        """
+        if lookup_id is None or not keys or not isinstance(request_configs, dict):
+            return
+        hint = request_configs.get(CXL_PREFETCH_HINT_CONFIG_KEY)
+        if not isinstance(hint, dict):
+            return
+
+        try:
+            max_chunks = min(
+                max(0, int(hint.get("max_chunks", 0))),
+                CXL_PREFETCH_HINT_MAX_CHUNKS,
+            )
+            key_offset = max(0, int(hint.get("key_offset", key_offset)))
+            raw_indices = hint.get("candidate_block_indices", [])
+            candidate_indices: list[int] = []
+            seen_indices: set[int] = set()
+            # Keep malformed/external requests from turning a best-effort
+            # control hint into an unbounded worker-side allocation.
+            candidate_limit = (
+                CXL_PREFETCH_HINT_MAX_CANDIDATES if max_chunks else 0
+            )
+            for raw_index in raw_indices:
+                index = max(0, int(raw_index))
+                if index in seen_indices:
+                    continue
+                seen_indices.add(index)
+                candidate_indices.append(index)
+                if len(candidate_indices) >= candidate_limit:
+                    break
+        except (TypeError, ValueError):
+            logger.debug("Ignoring malformed CXL prefetch lookup hint")
+            return
+
+        if max_chunks <= 0 or not candidate_indices:
+            return
+        candidate_index_set = set(candidate_indices)
+        selected_keys = [
+            key
+            for index, key in enumerate(keys)
+            if index + key_offset in candidate_index_set
+        ][:CXL_PREFETCH_HINT_MAX_CANDIDATES]
+        if not selected_keys:
+            return
+
+        try:
+            result = self._submit_cxl_prefetch_in_batches(
+                selected_keys,
+                batch_chunks=max_chunks,
+                request_id=lookup_id,
+            )
+            logger.debug(
+                "Registered route-carried CXL prefetch for lookup %s "
+                "(candidates=%d, batches=%s, scheduled=%s, deduplicated=%s)",
+                lookup_id,
+                len(selected_keys),
+                result.get("batches", 0),
+                result.get("scheduled", 0),
+                result.get("deduplicated", 0),
+            )
+        except Exception:
+            # A route hint must never make the demand lookup fail.
+            logger.debug(
+                "Route-carried CXL prefetch registration failed for lookup %s",
+                lookup_id,
+                exc_info=True,
+            )
 
     def get_cxl_prefetch_stats(self) -> dict[str, int]:
         """Return bounded reactive CXL prefetch admission/completion counters."""
@@ -1640,6 +1834,18 @@ class LMCacheEngine:
                 # If no tokens to lookup, return immediately
                 if not keys:
                     return res
+                token_chunk_size = getattr(self.token_database, "chunk_size", None)
+                hint_key_offset = (
+                    aligned_computed_tokens // int(token_chunk_size)
+                    if token_chunk_size is not None and int(token_chunk_size) > 0
+                    else 0
+                )
+                self._submit_cxl_prefetch_hint(
+                    lookup_id,
+                    keys,
+                    request_configs,
+                    key_offset=hint_key_offset,
+                )
                 # hit chunks by prefix matching
                 hit_chunks, block_mapping = self.storage_manager.batched_contains(
                     keys, search_range, pin
@@ -2567,6 +2773,8 @@ class LMCacheEngine:
             keys.append(key)
             cum_chunk_lengths.append(end)
 
+        self._submit_cxl_prefetch_hint(lookup_id, keys, request_configs)
+
         asyncio.run_coroutine_threadsafe(
             self.storage_manager.async_lookup_and_prefetch(
                 lookup_id, keys, cum_chunk_lengths, search_range, pin
@@ -2744,15 +2952,75 @@ class LMCacheEngine:
         tokens: Optional[Union[torch.Tensor, List[int]]] = None,
         locations: Optional[List[str]] = None,
         request_configs: Optional[dict] = None,
+        keep_fraction: Optional[float] = None,
     ) -> int:
         # TODO: need to clear by request_configs
         if self.save_only_first_rank:
             if self.metadata.is_first_rank():
-                num_removed = self._clear(tokens, locations, request_configs)
+                num_removed = self._clear(
+                    tokens, locations, request_configs, keep_fraction
+                )
                 return num_removed
             else:
                 return 0
-        return self._clear(tokens, locations, request_configs)
+        return self._clear(tokens, locations, request_configs, keep_fraction)
+
+    def snapshot_local_cpu(self, path: str) -> dict[str, Any]:
+        """Snapshot this worker's LocalCPU tier without clearing it."""
+        assert self.storage_manager is not None
+        backend = self.storage_manager.storage_backends.get("LocalCPUBackend")
+        if backend is None or not hasattr(backend, "snapshot"):
+            raise RuntimeError("LocalCPUBackend snapshot is unavailable")
+        return backend.snapshot(  # type: ignore[attr-defined]
+            path,
+            event_metadata=getattr(self, "_kv_store_meta_by_hash", None),
+        )
+
+    def restore_local_cpu(
+        self, path: str, clear_existing: bool = True
+    ) -> dict[str, Any]:
+        """Restore this worker's LocalCPU tier and publish CPU membership events."""
+        assert self.storage_manager is not None
+        backend = self.storage_manager.storage_backends.get("LocalCPUBackend")
+        if backend is None or not hasattr(backend, "restore"):
+            raise RuntimeError("LocalCPUBackend restore is unavailable")
+        result = backend.restore(path, clear_existing=clear_existing)  # type: ignore[attr-defined]
+
+        # A restored cache must be visible to the same Dynamo tier-aware index
+        # as a normal CPU admission.  The LocalCPU allocator event sender
+        # updates the LMCache controller, while these connector events update
+        # the vLLM/Dynamo event plane with the token metadata required to
+        # reconstruct the chunk hash chain.
+        if self.kv_events_enabled:
+            for restored in result.get("restored", []):
+                event = restored.get("event")
+                if event is None:
+                    continue
+                block_hash = int(restored["chunk_hash"])
+                parent = event.get("parent_block_hash")
+                token_ids = list(event.get("token_ids") or [])
+                block_size = int(event.get("block_size") or self.config.chunk_size)
+                lora_id = event.get("lora_id")
+                self._kv_store_meta_by_hash[block_hash] = (
+                    parent,
+                    token_ids,
+                    block_size,
+                    lora_id,
+                )
+                self.kv_events.append(
+                    CacheStoreEvent(
+                        block_hashes=[block_hash],
+                        parent_block_hash=parent,
+                        token_ids=token_ids,
+                        block_size=block_size,
+                        lora_id=lora_id,
+                        medium="CPU",
+                        origin="SNAPSHOT",
+                        worker_id=int(self.metadata.worker_id),
+                    )
+                )
+        result.pop("restored", None)
+        return result
 
     @_lmcache_nvtx_annotate
     def get_kv_events(self) -> Iterable[CacheStoreEvent | CacheRemoveEvent]:
@@ -2890,12 +3158,15 @@ class LMCacheEngine:
         tokens: Optional[Union[torch.Tensor, List[int]]] = None,
         locations: Optional[List[str]] = None,
         request_configs: Optional[dict] = None,
+        keep_fraction: Optional[float] = None,
     ) -> int:
         assert self.storage_manager is not None
         assert isinstance(self.storage_manager, StorageManager)
         # Clear all caches if tokens is None
         if tokens is None or len(tokens) == 0:
-            num_cleared = self.storage_manager.clear(locations)
+            num_cleared = self.storage_manager.clear(
+                locations, keep_fraction=keep_fraction
+            )
             return num_cleared
 
         num_removed = 0

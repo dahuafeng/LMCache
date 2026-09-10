@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -57,6 +58,35 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+
+
+@dataclass(slots=True)
+class _CxlPrefetchWork:
+    """One bounded logical CXL-to-CPU promotion queued for dispatch.
+
+    The Future associated with a work item represents the logical promotion,
+    not an individual executor attempt.  A resource-busy attempt can
+    therefore be returned to the queue without exposing a transient failure
+    to a demand lookup that observes the logical Future.
+    """
+
+    key: CacheEngineKey
+    cxl_backend: StorageBackendInterface
+    local_cpu_backend: LocalCPUBackend
+    request_id: Optional[str]
+    enqueued_monotonic_ns: int
+    deadline_monotonic_ns: int
+    next_attempt_monotonic_ns: int
+    attempts: int = 0
+
+
+_CXL_PREFETCH_RETRYABLE_REASONS = frozenset(
+    {
+        "cxl_resource_busy",
+        "cxl_resource_busy_local",
+        "cxl_resource_busy_shared",
+    }
+)
 
 
 # Helper function to get the class name of the backend
@@ -265,11 +295,11 @@ class StorageManager:
         self.prefetch_completed: dict[CacheEngineKey, PrefetchTask] = {}
         self._prefetch_lock = threading.Lock()
 
-        # Waiting-route CXL promotion is deliberately separate from the
-        # existing predictor/association registry above.  The Future table is
-        # the join point shared by speculative work and synchronous demand
-        # reads, while the semaphore bounds both executor admission and CPU
-        # pressure from speculative copies.
+        # Route-carried CXL promotion is deliberately separate from the
+        # existing predictor/association registry above. The Future table is
+        # the deduplication point shared by speculative work and demand
+        # lookups. A bounded pending queue absorbs transient CXL contention,
+        # while the dispatcher keeps resource-waiting work out of the executor.
         extra_config = (
             config.extra_config if isinstance(config.extra_config, dict) else {}
         )
@@ -279,22 +309,62 @@ class StorageManager:
         self.cxl_prefetch_max_inflight = max(
             1, int(extra_config.get("cxl_prefetch_max_inflight", 2))
         )
+        # Maximum number of chunks accepted from one submit call.  A request
+        # with more eligible candidates is split into multiple bounded calls
+        # by LMCacheEngine; this is intentionally not a per-request total.
         self.cxl_prefetch_max_chunks = max(
             1, int(extra_config.get("cxl_prefetch_max_chunks", 8))
         )
+        default_pending = max(1, self.cxl_prefetch_max_inflight * 4)
+        self.cxl_prefetch_max_pending = max(
+            1,
+            int(extra_config.get("cxl_prefetch_max_pending", default_pending)),
+        )
+        # A queued hint is useful only for a bounded amount of time.  This is
+        # separate from the LocalCPU residency TTL: it limits how long a
+        # resource-starved promotion may wait before being discarded.
+        self.cxl_prefetch_queue_ttl_ms = max(
+            1,
+            int(extra_config.get("cxl_prefetch_queue_ttl_ms", 2000)),
+        )
+        self.cxl_prefetch_retry_interval_ms = max(
+            1,
+            int(extra_config.get("cxl_prefetch_retry_interval_ms", 5)),
+        )
         self._cxl_prefetch_executor: Optional[ThreadPoolExecutor] = None
-        self._cxl_prefetch_semaphore: Optional[threading.BoundedSemaphore] = None
         self._cxl_prefetch_futures: dict[CacheEngineKey, Future] = {}
         self._cxl_prefetch_lock = threading.Lock()
+        self._cxl_prefetch_condition = threading.Condition(self._cxl_prefetch_lock)
+        self._cxl_prefetch_queue: deque[_CxlPrefetchWork] = deque()
+        self._cxl_prefetch_pending: dict[CacheEngineKey, _CxlPrefetchWork] = {}
+        self._cxl_prefetch_running: set[CacheEngineKey] = set()
+        # Keys for which the serving path won the CXL race.  A queued
+        # speculative copy is removed immediately; an already-running copy
+        # observes this marker before starting another CXL operation and keeps
+        # the marker until its logical Future is retired.
+        self._cxl_prefetch_demand_won: set[CacheEngineKey] = set()
+        self._cxl_prefetch_active_attempts = 0
+        self._cxl_prefetch_stopping = False
+        self._cxl_prefetch_dispatcher: Optional[threading.Thread] = None
         self._cxl_prefetch_stats = {
             "submitted": 0,
+            "queued": 0,
             "completed": 0,
             "succeeded": 0,
             "failed": 0,
             "deduplicated": 0,
             "already_cpu": 0,
             "capacity_rejected": 0,
+            "queue_rejected": 0,
+            "queue_expired": 0,
+            "queue_cancelled": 0,
+            "resource_retries": 0,
+            "resource_deferred": 0,
+            "queue_max_depth": 0,
+            "queue_wait_us_total": 0,
             "demand_joins": 0,
+            "demand_won": 0,
+            "demand_won_active": 0,
             "missing_cxl": 0,
             "metadata_missing": 0,
             "cxl_read_failed": 0,
@@ -302,6 +372,24 @@ class StorageManager:
             "cpu_admission_failed": 0,
             "backend_unavailable": 0,
             "unknown_failed": 0,
+            # Resource-arbitration counters are kept separate from executor
+            # admission.  An executor slot can be available while the CXL
+            # governor rejects the actual background operation.
+            "cxl_resource_busy": 0,
+            "cxl_resource_busy_local": 0,
+            "cxl_resource_busy_shared": 0,
+            "exception": 0,
+            # Demand-side funnel counters.  These describe what the request
+            # actually observed after a route-time hint was admitted.
+            "demand_observations": 0,
+            "demand_matches": 0,
+            "demand_cpu": 0,
+            "demand_cxl": 0,
+            "demand_cxl_shared": 0,
+            "demand_miss": 0,
+            "demand_consumed": 0,
+            "demand_raced": 0,
+            "demand_fallback": 0,
         }
         # Timeline-only, bounded per-key state.  The normal prefetch path does
         # not retain request/key history; this small registry exists solely so
@@ -317,21 +405,34 @@ class StorageManager:
         self._cxl_prefetch_admissions: dict[
             CacheEngineKey, dict[str, str | int | bool | None]
         ] = {}
+        self._cxl_prefetch_task_outcomes: dict[
+            CacheEngineKey, dict[str, str | int | bool | None]
+        ] = {}
         self._cxl_prefetch_completed_trace: OrderedDict[
             CacheEngineKey, dict[str, str | int | bool | None]
         ] = OrderedDict()
         if self.cxl_prefetch_enabled:
             self._cxl_prefetch_executor = ThreadPoolExecutor(
-                max_workers=self.cxl_prefetch_max_inflight,
+                # CxlResourceGovernor permits one background CXL operation per
+                # backend process.  Keep a single executor worker and use the
+                # explicit queue below for pending work; this avoids filling
+                # executor threads with resource-waiting tasks.
+                max_workers=1,
                 thread_name_prefix="lmcache-cxl-prefetch",
             )
-            self._cxl_prefetch_semaphore = threading.BoundedSemaphore(
-                self.cxl_prefetch_max_inflight
+            self._cxl_prefetch_dispatcher = threading.Thread(
+                target=self._cxl_prefetch_dispatch_loop,
+                name="lmcache-cxl-prefetch-dispatcher",
+                daemon=True,
             )
+            self._cxl_prefetch_dispatcher.start()
             logger.info(
-                "CXL lookahead promotion enabled (max_inflight=%d, max_chunks=%d)",
+                "CXL prefetch promotion enabled (max_inflight=%d, max_chunks=%d, "
+                "max_pending=%d, queue_ttl_ms=%d)",
                 self.cxl_prefetch_max_inflight,
                 self.cxl_prefetch_max_chunks,
+                self.cxl_prefetch_max_pending,
+                self.cxl_prefetch_queue_ttl_ms,
             )
 
         self.lmcache_worker = lmcache_worker
@@ -431,9 +532,265 @@ class StorageManager:
             return True
 
     def _get_prefetch_future(self, key: CacheEngineKey) -> Optional[Future]:
-        """Return the active lookahead-promotion Future for ``key`` if any."""
+        """Return the active CXL prefetch Future for ``key`` if any."""
         with self._cxl_prefetch_lock:
             return self._cxl_prefetch_futures.get(key)
+
+    def _get_cxl_prefetch_task_outcome(
+        self, key: CacheEngineKey
+    ) -> dict[str, str | int | bool | None]:
+        with self._cxl_prefetch_lock:
+            outcome = self._cxl_prefetch_task_outcomes.get(key)
+            return {} if outcome is None else dict(outcome)
+
+    def _mark_cxl_prefetch_demand_won(self, key: CacheEngineKey) -> bool:
+        """Retire speculative work after demand successfully reads from CXL.
+
+        The demand path calls this only after a CXL backend returned a real
+        memory object.  A queued promotion is removed from the pending table
+        and completed with a non-error ``demand_won`` outcome.  If the
+        promotion has already been dispatched, it cannot be safely aborted in
+        the middle of a native CXL read; the marker prevents it from starting
+        a later duplicate attempt and lets the existing Future finish.
+
+        Returns ``True`` when an active logical prefetch existed for ``key``.
+        """
+        work_to_cancel: Optional[_CxlPrefetchWork] = None
+        with self._cxl_prefetch_condition:
+            future = self._cxl_prefetch_futures.get(key)
+            if future is None or future.done():
+                return False
+
+            self._cxl_prefetch_demand_won.add(key)
+            self._cxl_prefetch_stats["demand_won"] += 1
+
+            if key in self._cxl_prefetch_running:
+                self._cxl_prefetch_stats["demand_won_active"] += 1
+            else:
+                work_to_cancel = self._cxl_prefetch_pending.pop(key, None)
+                if work_to_cancel is not None:
+                    # Remove the physical queue entry as well as the lookup
+                    # entry.  The queue is bounded, so this O(n) operation
+                    # keeps a canceled task from consuming capacity until the
+                    # dispatcher happens to wake up.
+                    try:
+                        self._cxl_prefetch_queue.remove(work_to_cancel)
+                    except ValueError:
+                        # The dispatcher may have already consumed the queue
+                        # node; the running case is protected by the same
+                        # condition and is handled above.
+                        pass
+                    self._cxl_prefetch_stats["queue_cancelled"] += 1
+
+            self._cxl_prefetch_condition.notify_all()
+
+        if work_to_cancel is not None:
+            # Do not complete the concurrent Future while holding the
+            # bookkeeping lock: its callback re-enters this condition.
+            self._set_cxl_prefetch_terminal_result(
+                work_to_cancel, False, "demand_won"
+            )
+        return True
+
+    def _release_cxl_prefetch_attempt(self, key: CacheEngineKey) -> None:
+        """Release the bounded executor slot for one queue attempt."""
+        with self._cxl_prefetch_condition:
+            self._cxl_prefetch_running.discard(key)
+            if self._cxl_prefetch_active_attempts > 0:
+                self._cxl_prefetch_active_attempts -= 1
+            self._cxl_prefetch_condition.notify_all()
+
+    def _set_cxl_prefetch_terminal_result(
+        self,
+        work: _CxlPrefetchWork,
+        success: bool,
+        outcome: Optional[str] = None,
+    ) -> None:
+        """Complete the logical Future after all retry decisions are made."""
+        future: Optional[Future]
+        with self._cxl_prefetch_condition:
+            future = self._cxl_prefetch_futures.get(work.key)
+            if future is None or future.done():
+                return
+            self._cxl_prefetch_pending.pop(work.key, None)
+            self._cxl_prefetch_running.discard(work.key)
+            if outcome is not None:
+                queue_wait_us = max(
+                    0,
+                    (time.monotonic_ns() - work.enqueued_monotonic_ns) // 1000,
+                )
+                self._cxl_prefetch_task_outcomes[work.key] = {
+                    "promotion_start_unix_ns": None,
+                    "promotion_success": success,
+                    "promotion_outcome": outcome,
+                    "failure_reason": (
+                        None
+                        if success or outcome == "demand_won"
+                        else outcome
+                    ),
+                    "queue_wait_us": queue_wait_us,
+                }
+            self._cxl_prefetch_condition.notify_all()
+
+        # Future callbacks acquire _cxl_prefetch_lock, so never invoke them
+        # while holding the bookkeeping condition.
+        future.set_result(bool(success))
+
+    def _requeue_cxl_prefetch_after_resource_busy(
+        self,
+        work: _CxlPrefetchWork,
+    ) -> bool:
+        """Return a resource-busy attempt to the bounded pending queue."""
+        now_ns = time.monotonic_ns()
+        with self._cxl_prefetch_condition:
+            future = self._cxl_prefetch_futures.get(work.key)
+            if (
+                self._cxl_prefetch_stopping
+                or future is None
+                or future.done()
+                or now_ns >= work.deadline_monotonic_ns
+            ):
+                return False
+
+            self._cxl_prefetch_running.discard(work.key)
+            if self._cxl_prefetch_active_attempts > 0:
+                self._cxl_prefetch_active_attempts -= 1
+
+            work.attempts += 1
+            backoff_ms = min(
+                100,
+                self.cxl_prefetch_retry_interval_ms
+                * (2 ** min(work.attempts - 1, 4)),
+            )
+            work.next_attempt_monotonic_ns = now_ns + backoff_ms * 1_000_000
+            self._cxl_prefetch_pending[work.key] = work
+            # Keep FIFO ordering across resource retries.  The dispatcher
+            # sleeps until this item is eligible and never occupies an
+            # executor thread while demand is using CXL.
+            self._cxl_prefetch_queue.appendleft(work)
+            self._cxl_prefetch_stats["resource_retries"] += 1
+            self._cxl_prefetch_stats["resource_deferred"] += 1
+            self._cxl_prefetch_condition.notify_all()
+            return True
+
+    def _execute_cxl_prefetch_work(self, work: _CxlPrefetchWork) -> None:
+        """Execute one attempt and retry only transient resource failures."""
+        queue_wait_us = max(
+            0,
+            (time.monotonic_ns() - work.enqueued_monotonic_ns) // 1000,
+        )
+        try:
+            succeeded = self._run_cxl_prefetch_task(
+                work.key,
+                work.cxl_backend,
+                work.local_cpu_backend,
+                work.request_id,
+                queue_wait_us=queue_wait_us,
+            )
+            outcome = self._get_cxl_prefetch_task_outcome(work.key)
+            reason = outcome.get("failure_reason")
+            if not succeeded and reason in _CXL_PREFETCH_RETRYABLE_REASONS:
+                if self._requeue_cxl_prefetch_after_resource_busy(work):
+                    logger.debug(
+                        "Deferred CXL prefetch key %s after %s (attempt=%d)",
+                        getattr(work.key, "chunk_hash", work.key),
+                        reason,
+                        work.attempts,
+                    )
+                    return
+                with self._cxl_prefetch_lock:
+                    if self._cxl_prefetch_stopping:
+                        terminal_outcome = "shutdown"
+                    else:
+                        self._cxl_prefetch_stats["queue_expired"] += 1
+                        terminal_outcome = "queue_expired"
+                self._release_cxl_prefetch_attempt(work.key)
+                self._set_cxl_prefetch_terminal_result(
+                    work, False, terminal_outcome
+                )
+                return
+
+            self._release_cxl_prefetch_attempt(work.key)
+            self._set_cxl_prefetch_terminal_result(work, bool(succeeded))
+        except Exception:
+            logger.debug(
+                "CXL prefetch queue attempt failed for key %s",
+                getattr(work.key, "chunk_hash", work.key),
+                exc_info=True,
+            )
+            with self._cxl_prefetch_lock:
+                self._cxl_prefetch_stats["unknown_failed"] += 1
+                self._cxl_prefetch_stats["exception"] += 1
+            self._release_cxl_prefetch_attempt(work.key)
+            self._set_cxl_prefetch_terminal_result(work, False, "exception")
+
+    def _cxl_prefetch_dispatch_loop(self) -> None:
+        """Dispatch queued work without occupying threads while CXL is busy."""
+        while True:
+            work: Optional[_CxlPrefetchWork] = None
+            expired = False
+            with self._cxl_prefetch_condition:
+                while not self._cxl_prefetch_stopping and not self._cxl_prefetch_queue:
+                    self._cxl_prefetch_condition.wait()
+                if self._cxl_prefetch_stopping:
+                    return
+
+                candidate = self._cxl_prefetch_queue[0]
+                if self._cxl_prefetch_pending.get(candidate.key) is not candidate:
+                    self._cxl_prefetch_queue.popleft()
+                    continue
+
+                now_ns = time.monotonic_ns()
+                if now_ns >= candidate.deadline_monotonic_ns:
+                    self._cxl_prefetch_queue.popleft()
+                    self._cxl_prefetch_pending.pop(candidate.key, None)
+                    expired = True
+                    work = candidate
+                elif (
+                    self._cxl_prefetch_active_attempts >= 1
+                    or candidate.next_attempt_monotonic_ns > now_ns
+                ):
+                    wait_ns = candidate.next_attempt_monotonic_ns - now_ns
+                    if self._cxl_prefetch_active_attempts >= 1:
+                        wait_ns = max(wait_ns, 1_000_000)
+                    self._cxl_prefetch_condition.wait(
+                        timeout=max(0.001, wait_ns / 1_000_000_000)
+                    )
+                    continue
+                else:
+                    self._cxl_prefetch_queue.popleft()
+                    self._cxl_prefetch_pending.pop(candidate.key, None)
+                    self._cxl_prefetch_running.add(candidate.key)
+                    self._cxl_prefetch_active_attempts += 1
+                    work = candidate
+
+            if work is None:
+                continue
+            if expired:
+                with self._cxl_prefetch_lock:
+                    self._cxl_prefetch_stats["queue_expired"] += 1
+                self._set_cxl_prefetch_terminal_result(work, False, "queue_expired")
+                continue
+
+            executor = self._cxl_prefetch_executor
+            if executor is None:
+                self._release_cxl_prefetch_attempt(work.key)
+                self._set_cxl_prefetch_terminal_result(work, False, "shutdown")
+                continue
+            try:
+                executor.submit(self._execute_cxl_prefetch_work, work)
+            except Exception:
+                logger.debug(
+                    "Unable to dispatch CXL prefetch key %s",
+                    getattr(work.key, "chunk_hash", work.key),
+                    exc_info=True,
+                )
+                with self._cxl_prefetch_lock:
+                    self._cxl_prefetch_stats["capacity_rejected"] += 1
+                self._release_cxl_prefetch_attempt(work.key)
+                self._set_cxl_prefetch_terminal_result(
+                    work, False, "executor_rejected"
+                )
 
     @staticmethod
     def _cxl_prefetch_timeline_enabled() -> bool:
@@ -475,19 +832,20 @@ class StorageManager:
         memory_obj: Optional[MemoryObj],
         backend_name: str,
     ) -> None:
-        if (
-            not self._cxl_prefetch_timeline_enabled()
-            or not request_id
-            or memory_obj is None
-            or backend_name != "LocalCPUBackend"
-        ):
+        if not self._cxl_prefetch_timeline_enabled() or not request_id:
             return
         with self._cxl_prefetch_lock:
-            trace = self._cxl_prefetch_completed_trace.get(key)
+            # Prefer an active admission over an older completed trace.  The
+            # same logical key can be hinted again after a previous request.
+            trace = self._cxl_prefetch_admissions.get(key)
+            if trace is None:
+                trace = self._cxl_prefetch_completed_trace.get(key)
             if trace is not None:
                 trace = dict(trace)
         if trace is None:
             return
+
+        demand_ns = time.time_ns()
         prefetch_request_id = trace.get("request_id")
         request_matches_prefetch = bool(
             prefetch_request_id == request_id
@@ -496,23 +854,91 @@ class StorageManager:
                 and request_id.startswith(prefetch_request_id + "-")
             )
         )
+        promotion_start_ns = trace.get("promotion_start_unix_ns")
+        promotion_complete_ns = trace.get("promotion_complete_unix_ns")
+        promotion_success = trace.get("promotion_success")
+        promotion_outcome = trace.get("promotion_outcome")
+        demand_before_promotion_complete = bool(
+            request_matches_prefetch
+            and (
+                promotion_complete_ns is None
+                or (
+                    isinstance(promotion_complete_ns, int)
+                    and demand_ns < promotion_complete_ns
+                )
+            )
+        )
+        cxl_backend = self.storage_backends.get("CxlBackend")
+        observed_backend = backend_name
+        cxl_shared = False
+        if backend_name == "CxlBackend" and cxl_backend is not None:
+            try:
+                cxl_shared = bool(cxl_backend.is_shared_origin(key))
+            except Exception:
+                logger.debug(
+                    "Unable to attribute CXL demand origin for key=%s",
+                    getattr(key, "chunk_hash", key),
+                    exc_info=True,
+                )
+            if cxl_shared:
+                observed_backend = "CxlBackend:shared"
+
         consumed = bool(
             request_matches_prefetch
-            and trace.get("cxl_present") is True
-            and trace.get("local_cpu_present") is False
+            and memory_obj is not None
+            and backend_name == "LocalCPUBackend"
+            and promotion_success is True
+            and promotion_outcome == "success"
+            and not demand_before_promotion_complete
         )
+        raced = bool(
+            request_matches_prefetch and demand_before_promotion_complete
+        )
+        fallback = bool(request_matches_prefetch and not consumed)
+        with self._cxl_prefetch_lock:
+            self._cxl_prefetch_stats["demand_observations"] += 1
+            if request_matches_prefetch:
+                self._cxl_prefetch_stats["demand_matches"] += 1
+            if backend_name == "LocalCPUBackend" and memory_obj is not None:
+                self._cxl_prefetch_stats["demand_cpu"] += 1
+            elif backend_name == "CxlBackend":
+                self._cxl_prefetch_stats["demand_cxl"] += 1
+                if cxl_shared:
+                    self._cxl_prefetch_stats["demand_cxl_shared"] += 1
+            elif backend_name == "MISS" or memory_obj is None:
+                self._cxl_prefetch_stats["demand_miss"] += 1
+            if consumed:
+                self._cxl_prefetch_stats["demand_consumed"] += 1
+            if raced:
+                self._cxl_prefetch_stats["demand_raced"] += 1
+            if fallback:
+                self._cxl_prefetch_stats["demand_fallback"] += 1
+
         logger.info(
             "CXL prefetch funnel demand request_id=%s worker_id=%s key=%s "
-            "backend=%s prefetch_request_id=%s promotion_complete_unix_ns=%s "
-            "consumed_prefetch=%s demand_unix_ns=%d",
+            "backend=%s observed_backend=%s memory_present=%s "
+            "prefetch_request_id=%s request_matches_prefetch=%s "
+            "promotion_start_unix_ns=%s promotion_complete_unix_ns=%s "
+            "promotion_success=%s promotion_outcome=%s failure_reason=%s "
+            "demand_before_promotion_complete=%s consumed_prefetch=%s "
+            "demand_fallback=%s demand_unix_ns=%d",
             request_id,
             getattr(self, "worker_id", "unknown"),
             getattr(key, "chunk_hash", key),
             backend_name,
+            observed_backend,
+            memory_obj is not None,
             prefetch_request_id,
-            trace.get("promotion_complete_unix_ns"),
+            request_matches_prefetch,
+            promotion_start_ns,
+            promotion_complete_ns,
+            promotion_success,
+            promotion_outcome,
+            trace.get("failure_reason"),
+            demand_before_promotion_complete,
             consumed,
-            time.time_ns(),
+            fallback,
+            demand_ns,
         )
 
     def _local_cpu_backend(self) -> Optional[LocalCPUBackend]:
@@ -529,25 +955,59 @@ class StorageManager:
         cxl_backend: StorageBackendInterface,
         local_cpu_backend: LocalCPUBackend,
         request_id: Optional[str] = None,
+        *,
+        queue_wait_us: int = 0,
     ) -> bool:
+        promotion_start_ns = time.time_ns()
+        with self._cxl_prefetch_lock:
+            self._cxl_prefetch_task_outcomes[key] = {
+                "promotion_start_unix_ns": promotion_start_ns,
+                "promotion_success": None,
+                "promotion_outcome": "running",
+                "failure_reason": None,
+                "queue_wait_us": queue_wait_us,
+            }
+
+        def finish(success: bool, outcome: str) -> bool:
+            with self._cxl_prefetch_lock:
+                self._cxl_prefetch_task_outcomes[key] = {
+                    "promotion_start_unix_ns": promotion_start_ns,
+                    "promotion_success": success,
+                    "promotion_outcome": outcome,
+                    "failure_reason": (
+                        None
+                        if success or outcome == "demand_won"
+                        else outcome
+                    ),
+                    "queue_wait_us": queue_wait_us,
+                }
+            return success
+
         timeline_enabled = self._cxl_prefetch_timeline_enabled()
         if timeline_enabled and request_id:
             logger.info(
                 "CXL prefetch timeline promotion_start request_id=%s "
                 "promotion_start_unix_ns=%d key=%s",
                 request_id,
-                time.time_ns(),
+                promotion_start_ns,
                 getattr(key, "chunk_hash", key),
             )
+        # Demand may have won after this work was dispatched but before the
+        # background thread entered the backend.  Retire the logical task
+        # without issuing another CXL read.
+        with self._cxl_prefetch_condition:
+            demand_won = key in self._cxl_prefetch_demand_won
+        if demand_won:
+            return finish(False, "demand_won")
         # A demand lookup may have populated CPU after admission but before
         # the worker got scheduled.  Avoid a redundant CXL read in that case.
         if local_cpu_backend.contains(key):
-            return True
+            return finish(True, "already_cpu_race")
         submit = getattr(cxl_backend, "submit_prefetch_task", None)
         if not callable(submit):
             with self._cxl_prefetch_lock:
                 self._cxl_prefetch_stats["backend_unavailable"] += 1
-            return False
+            return finish(False, "backend_unavailable")
         try:
             succeeded = bool(submit(key))
             if not succeeded:
@@ -564,26 +1024,35 @@ class StorageManager:
                         "cpu_capacity_rejected",
                         "cpu_admission_failed",
                         "backend_unavailable",
+                        "cxl_resource_busy",
+                        "cxl_resource_busy_local",
+                        "cxl_resource_busy_shared",
                     }
                     else "unknown_failed"
                 )
                 with self._cxl_prefetch_lock:
                     self._cxl_prefetch_stats[stat_name] += 1
+                    if stat_name == "cxl_resource_busy_local":
+                        self._cxl_prefetch_stats["cxl_resource_busy"] += 1
+                    elif stat_name == "cxl_resource_busy_shared":
+                        self._cxl_prefetch_stats["cxl_resource_busy"] += 1
                 logger.debug(
-                    "CXL lookahead promotion skipped for key %s: %s",
+                    "CXL prefetch promotion skipped for key %s: %s",
                     getattr(key, "chunk_hash", key),
-                    stat_name,
+                    reason or stat_name,
                 )
-            return succeeded
+                return finish(False, reason or stat_name)
+            return finish(True, "success")
         except Exception:
             with self._cxl_prefetch_lock:
                 self._cxl_prefetch_stats["unknown_failed"] += 1
+                self._cxl_prefetch_stats["exception"] += 1
             logger.debug(
-                "CXL lookahead promotion task failed for key %s",
+                "CXL prefetch promotion task failed for key %s",
                 getattr(key, "chunk_hash", key),
                 exc_info=True,
             )
-            return False
+            return finish(False, "exception")
 
     def _cxl_prefetch_done(
         self,
@@ -596,53 +1065,94 @@ class StorageManager:
             succeeded = bool(future.result())
         except Exception:
             logger.debug(
-                "CXL lookahead promotion future failed for key %s",
+                "CXL prefetch promotion future failed for key %s",
                 getattr(key, "chunk_hash", key),
                 exc_info=True,
             )
 
         complete_ns = time.time_ns()
         admission_trace: Optional[dict[str, str | int | bool | None]] = None
-        with self._cxl_prefetch_lock:
+        cancelled_by_demand = False
+        with self._cxl_prefetch_condition:
             if self._cxl_prefetch_futures.get(key) is future:
                 self._cxl_prefetch_futures.pop(key, None)
+            self._cxl_prefetch_pending.pop(key, None)
+            self._cxl_prefetch_running.discard(key)
+            cancelled_by_demand = bool(
+                self._cxl_prefetch_task_outcomes.get(key, {}).get(
+                    "promotion_outcome"
+                )
+                == "demand_won"
+            )
+            self._cxl_prefetch_demand_won.discard(key)
             admission_trace = self._cxl_prefetch_admissions.pop(key, None)
-            self._cxl_prefetch_stats["completed"] += 1
-            if succeeded:
-                self._cxl_prefetch_stats["succeeded"] += 1
-                if admission_trace is not None:
-                    admission_trace["promotion_complete_unix_ns"] = complete_ns
-                    self._cxl_prefetch_completed_trace[key] = admission_trace
-                    self._cxl_prefetch_completed_trace.move_to_end(key)
-                    while (
-                        len(self._cxl_prefetch_completed_trace)
-                        > self._cxl_prefetch_trace_capacity
-                    ):
-                        self._cxl_prefetch_completed_trace.popitem(last=False)
-            else:
-                self._cxl_prefetch_stats["failed"] += 1
+            outcome_trace = self._cxl_prefetch_task_outcomes.pop(key, None)
+            if outcome_trace is None:
+                outcome_trace = {
+                    "promotion_start_unix_ns": complete_ns,
+                    "promotion_success": succeeded,
+                    "promotion_outcome": "success"
+                    if succeeded
+                    else "future_exception",
+                    "failure_reason": None if succeeded else "future_exception",
+                }
+                if not succeeded:
+                    self._cxl_prefetch_stats["exception"] += 1
+            if admission_trace is None:
+                admission_trace = {
+                    "request_id": request_id,
+                    "cxl_present": None,
+                    "local_cpu_present": False,
+                    "admission_unix_ns": outcome_trace.get(
+                        "promotion_start_unix_ns", complete_ns
+                    ),
+                }
+            admission_trace.update(outcome_trace)
+            admission_trace["promotion_complete_unix_ns"] = complete_ns
+            start_ns = admission_trace.get("promotion_start_unix_ns")
+            if isinstance(start_ns, int):
+                admission_trace["promotion_duration_us"] = max(
+                    0, (complete_ns - start_ns) // 1000
+                )
+            queue_wait_us = outcome_trace.get("queue_wait_us")
+            if isinstance(queue_wait_us, int):
+                self._cxl_prefetch_stats["queue_wait_us_total"] += max(
+                    0, queue_wait_us
+                )
+            if not cancelled_by_demand:
+                self._cxl_prefetch_stats["completed"] += 1
+                if succeeded:
+                    self._cxl_prefetch_stats["succeeded"] += 1
+                else:
+                    self._cxl_prefetch_stats["failed"] += 1
+            self._cxl_prefetch_completed_trace[key] = admission_trace
+            self._cxl_prefetch_completed_trace.move_to_end(key)
+            while (
+                len(self._cxl_prefetch_completed_trace)
+                > self._cxl_prefetch_trace_capacity
+            ):
+                self._cxl_prefetch_completed_trace.popitem(last=False)
+            self._cxl_prefetch_condition.notify_all()
 
         if request_id and self._cxl_prefetch_timeline_enabled():
             logger.info(
                 "CXL prefetch timeline promotion_complete request_id=%s "
                 "promotion_complete_unix_ns=%d success=%s key=%s "
-                "cxl_present=%s local_cpu_present=%s",
+                "cxl_present=%s local_cpu_present=%s "
+                "promotion_start_unix_ns=%s promotion_duration_us=%s "
+                "queue_wait_us=%s promotion_outcome=%s failure_reason=%s",
                 request_id,
                 complete_ns,
                 succeeded,
                 getattr(key, "chunk_hash", key),
-                None if admission_trace is None else admission_trace.get("cxl_present"),
-                None
-                if admission_trace is None
-                else admission_trace.get("local_cpu_present"),
+                admission_trace.get("cxl_present"),
+                admission_trace.get("local_cpu_present"),
+                admission_trace.get("promotion_start_unix_ns"),
+                admission_trace.get("promotion_duration_us"),
+                admission_trace.get("queue_wait_us"),
+                admission_trace.get("promotion_outcome"),
+                admission_trace.get("failure_reason"),
             )
-
-        semaphore = self._cxl_prefetch_semaphore
-        if semaphore is not None:
-            try:
-                semaphore.release()
-            except ValueError:
-                logger.warning("CXL lookahead promotion semaphore release overflow")
 
     def submit_cxl_prefetch(
         self,
@@ -650,18 +1160,21 @@ class StorageManager:
         max_chunks: Optional[int] = None,
         request_id: Optional[str] = None,
     ) -> dict[str, int | bool | str | None]:
-        """Submit bounded CXL-to-CPU work without waiting for completion.
+        """Queue bounded CXL-to-CPU work without waiting for completion.
 
-        The returned counters describe admission only.  A ``False`` result
-        from a background task is intentionally not propagated as a request
-        error; the demand path will fall back to the normal storage lookup.
+        ``scheduled`` means that a logical promotion Future was accepted by
+        the bounded pending queue.  The dispatcher retries transient CXL
+        resource denials later; only queue overflow or a non-retryable backend
+        failure prevents the promotion from completing.
         """
         result: dict[str, int | bool | str | None] = {
             "enabled": self.cxl_prefetch_enabled,
             "scheduled": 0,
+            "queued": 0,
             "deduplicated": 0,
             "already_cpu": 0,
             "capacity_rejected": 0,
+            "queue_rejected": 0,
             "status": "disabled" if not self.cxl_prefetch_enabled else "accepted",
         }
         if not self.cxl_prefetch_enabled:
@@ -676,12 +1189,10 @@ class StorageManager:
         cxl_backend = self.storage_backends.get("CxlBackend")
         local_cpu_backend = self._local_cpu_backend()
         executor = self._cxl_prefetch_executor
-        semaphore = self._cxl_prefetch_semaphore
         if (
             cxl_backend is None
             or local_cpu_backend is None
             or executor is None
-            or semaphore is None
         ):
             result["status"] = "unavailable"
             return result
@@ -716,7 +1227,7 @@ class StorageManager:
                     self._cxl_prefetch_stats["already_cpu"] += 1
                 continue
 
-            with self._cxl_prefetch_lock:
+            with self._cxl_prefetch_condition:
                 if key in self._cxl_prefetch_futures:
                     self._log_cxl_prefetch_admission(
                         request_id=request_id,
@@ -729,138 +1240,134 @@ class StorageManager:
                     self._cxl_prefetch_stats["deduplicated"] += 1
                     continue
 
-            if not semaphore.acquire(blocking=False):
-                self._log_cxl_prefetch_admission(
-                    request_id=request_id,
-                    key=key,
-                    cxl_present=cxl_present,
-                    local_cpu_present=False,
-                    outcome="capacity_rejected",
-                )
-                result["capacity_rejected"] = int(result["capacity_rejected"]) + 1
-                with self._cxl_prefetch_lock:
-                    self._cxl_prefetch_stats["capacity_rejected"] += 1
-                break
-
-            # Recheck after acquiring the slot to close races with another
-            # submitter or a demand hit.
-            if local_cpu_backend.contains(key):
-                semaphore.release()
-                self._log_cxl_prefetch_admission(
-                    request_id=request_id,
-                    key=key,
-                    cxl_present=cxl_present,
-                    local_cpu_present=True,
-                    outcome="already_cpu_race",
-                )
-                result["already_cpu"] = int(result["already_cpu"]) + 1
-                with self._cxl_prefetch_lock:
-                    self._cxl_prefetch_stats["already_cpu"] += 1
-                continue
-
             future: Optional[Future] = None
-            with self._cxl_prefetch_lock:
-                if key in self._cxl_prefetch_futures:
-                    semaphore.release()
-                    self._log_cxl_prefetch_admission(
-                        request_id=request_id,
-                        key=key,
-                        cxl_present=cxl_present,
-                        local_cpu_present=False,
-                        outcome="deduplicated_race",
-                    )
+            queue_depth = 0
+            admission_outcome = "submitted"
+            with self._cxl_prefetch_condition:
+                if self._cxl_prefetch_stopping:
+                    admission_outcome = "queue_closed"
+                    result["queue_rejected"] = int(result["queue_rejected"]) + 1
+                    self._cxl_prefetch_stats["queue_rejected"] += 1
+                elif key in self._cxl_prefetch_futures:
+                    admission_outcome = "deduplicated_race"
                     result["deduplicated"] = int(result["deduplicated"]) + 1
                     self._cxl_prefetch_stats["deduplicated"] += 1
-                    continue
-                try:
-                    future = executor.submit(
-                        self._run_cxl_prefetch_task,
-                        key,
-                        cxl_backend,
-                        local_cpu_backend,
-                        request_id,
-                    )
-                except Exception:
-                    semaphore.release()
-                    self._log_cxl_prefetch_admission(
-                        request_id=request_id,
+                elif (
+                    len(self._cxl_prefetch_queue)
+                    + self._cxl_prefetch_active_attempts
+                    >= self.cxl_prefetch_max_pending
+                ):
+                    admission_outcome = "queue_rejected"
+                    result["queue_rejected"] = int(result["queue_rejected"]) + 1
+                    self._cxl_prefetch_stats["queue_rejected"] += 1
+                else:
+                    now_monotonic_ns = time.monotonic_ns()
+                    work = _CxlPrefetchWork(
                         key=key,
-                        cxl_present=cxl_present,
-                        local_cpu_present=False,
-                        outcome="executor_rejected",
+                        cxl_backend=cxl_backend,
+                        local_cpu_backend=local_cpu_backend,
+                        request_id=request_id,
+                        enqueued_monotonic_ns=now_monotonic_ns,
+                        deadline_monotonic_ns=(
+                            now_monotonic_ns
+                            + self.cxl_prefetch_queue_ttl_ms * 1_000_000
+                        ),
+                        next_attempt_monotonic_ns=now_monotonic_ns,
                     )
-                    result["capacity_rejected"] = int(result["capacity_rejected"]) + 1
-                    self._cxl_prefetch_stats["capacity_rejected"] += 1
-                    logger.debug(
-                        "Unable to submit CXL lookahead promotion task",
-                        exc_info=True,
+                    future = Future()
+                    self._cxl_prefetch_futures[key] = future
+                    self._cxl_prefetch_pending[key] = work
+                    self._cxl_prefetch_queue.append(work)
+                    queue_depth = len(self._cxl_prefetch_queue)
+                    self._cxl_prefetch_stats["submitted"] += 1
+                    self._cxl_prefetch_stats["queued"] += 1
+                    self._cxl_prefetch_stats["queue_max_depth"] = max(
+                        self._cxl_prefetch_stats["queue_max_depth"], queue_depth
                     )
-                    break
-                self._cxl_prefetch_futures[key] = future
-                self._cxl_prefetch_admissions[key] = {
-                    "request_id": request_id,
-                    "cxl_present": cxl_present,
-                    "local_cpu_present": False,
-                    "admission_unix_ns": time.time_ns(),
-                }
-                self._cxl_prefetch_stats["submitted"] += 1
-                result["scheduled"] = int(result["scheduled"]) + 1
-            self._log_cxl_prefetch_admission(
-                request_id=request_id,
-                key=key,
-                cxl_present=cxl_present,
-                local_cpu_present=False,
-                outcome="submitted",
-            )
-            # A very fast fake/backend task can already be complete here.  Add
-            # the callback outside the non-reentrant bookkeeping lock so the
-            # immediate callback path cannot deadlock.
-            if future is not None:
+                    result["scheduled"] = int(result["scheduled"]) + 1
+                    result["queued"] = int(result["queued"]) + 1
+                    self._cxl_prefetch_condition.notify_all()
+
+            if admission_outcome == "queue_closed":
+                result["status"] = "closing"
+            elif admission_outcome == "queue_rejected":
+                result["status"] = "queue_full"
+            elif admission_outcome == "deduplicated_race":
+                pass
+            elif future is not None:
+                # A very fast fake/backend task can already be complete here.
+                # Adding the callback outside the bookkeeping lock keeps that
+                # path re-entrant-safe.
                 future.add_done_callback(
                     lambda completed, prefetch_key=key, prefetch_request_id=request_id: self._cxl_prefetch_done(
                         prefetch_key, completed, prefetch_request_id
                     )
                 )
+                self._log_cxl_prefetch_admission(
+                    request_id=request_id,
+                    key=key,
+                    cxl_present=cxl_present,
+                    local_cpu_present=False,
+                    outcome=admission_outcome,
+                )
+                logger.debug(
+                    "Queued CXL prefetch key %s (queue_depth=%d)",
+                    getattr(key, "chunk_hash", key),
+                    queue_depth,
+                )
+            else:
+                self._log_cxl_prefetch_admission(
+                    request_id=request_id,
+                    key=key,
+                    cxl_present=cxl_present,
+                    local_cpu_present=False,
+                    outcome=admission_outcome,
+                )
+                if admission_outcome == "deduplicated_race":
+                    # The first duplicate check above normally catches this;
+                    # keep this path observable if another submitter wins the
+                    # race between the two checks.
+                    continue
+                break
 
         return result
 
     def _wait_for_cxl_prefetch(self, key: CacheEngineKey) -> bool:
-        future = self._get_prefetch_future(key)
-        if future is None:
-            return False
-        with self._cxl_prefetch_lock:
+        """Wait only for an already-running attempt, never for queued work.
+
+        A demand lookup must be able to fall through to CXL when a hint is
+        merely waiting for a resource slot. If the copy already holds the
+        resource, waiting for that one attempt avoids a duplicate read and is
+        bounded by the current chunk; a resource-busy attempt wakes the demand
+        as soon as it is returned to the queue.
+        """
+        with self._cxl_prefetch_condition:
+            future = self._cxl_prefetch_futures.get(key)
+            if future is None or key not in self._cxl_prefetch_running:
+                return False
             self._cxl_prefetch_stats["demand_joins"] += 1
+            while key in self._cxl_prefetch_running and not future.done():
+                self._cxl_prefetch_condition.wait()
+            # A transient resource denial clears ``running`` and requeues the
+            # same logical Future. Do not turn that wake-up into a wait for the
+            # eventual retry; demand must fall through to its own CXL path.
+            if not future.done():
+                return False
         try:
             return bool(future.result())
         except Exception:
             logger.debug(
-                "Demand join observed failed CXL lookahead promotion for key %s",
+                "Demand join observed failed CXL prefetch promotion for key %s",
                 getattr(key, "chunk_hash", key),
                 exc_info=True,
             )
             return False
 
     def _wait_for_cxl_prefetches(self, keys: Sequence[CacheEngineKey]) -> None:
-        # Keep the Future references first: completion callbacks remove entries
-        # from the table while a demand lookup is traversing the prefix.
-        futures: list[Future] = []
-        seen: set[int] = set()
+        # Only join attempts that already hold the resource. Queued retries are
+        # deliberately left for the dispatcher so demand can enter CXL first.
         for key in keys:
-            future = self._get_prefetch_future(key)
-            if future is None or id(future) in seen:
-                continue
-            seen.add(id(future))
-            futures.append(future)
-        for future in futures:
-            with self._cxl_prefetch_lock:
-                self._cxl_prefetch_stats["demand_joins"] += 1
-            try:
-                future.result()
-            except Exception:
-                logger.debug(
-                    "Demand join observed failed CXL lookahead promotion",
-                    exc_info=True,
-                )
+            self._wait_for_cxl_prefetch(key)
 
     async def _await_cxl_prefetch_prefix(
         self,
@@ -879,22 +1386,18 @@ class StorageManager:
         for key in keys:
             if local_cpu_backend.contains(key):
                 continue
-            future = self._get_prefetch_future(key)
-            if future is None:
-                break
-            with self._cxl_prefetch_lock:
-                self._cxl_prefetch_stats["demand_joins"] += 1
-            try:
-                await asyncio.wrap_future(future)
-            except Exception:
-                logger.debug(
-                "Async demand join observed failed CXL lookahead promotion",
-                    exc_info=True,
-                )
-            if not local_cpu_backend.contains(key):
-                # Preserve the existing fallback behavior after a failed or
-                # incomplete speculative task.
-                break
+            with self._cxl_prefetch_condition:
+                future = self._cxl_prefetch_futures.get(key)
+                attempt_active = key in self._cxl_prefetch_running
+            if future is None or not attempt_active:
+                # Route-carried hints may target sparse CXL-only blocks. A
+                # queued retry must not delay demand; the normal backend path
+                # will acquire the serving-priority CXL slot itself.
+                continue
+            # Wait for only the active chunk. If it loses resource admission,
+            # _wait_for_cxl_prefetch() returns when the work is requeued rather
+            # than waiting for the whole queue TTL.
+            await asyncio.to_thread(self._wait_for_cxl_prefetch, key)
 
     def get_cxl_prefetch_stats(self) -> dict[str, int]:
         with self._cxl_prefetch_lock:
@@ -1190,9 +1693,10 @@ class StorageManager:
         Blocking function to get the memory object from the storages.
         """
 
-        # Local CPU is the demand-facing L1.  If a route-time task is already
-        # copying this key, join it before allowing the normal CXL fallback to
-        # start another read.
+        # Local CPU is the demand-facing L1. If a route-time task is already
+        # copying this key, join only that active chunk before allowing the
+        # normal CXL fallback to start another read. Queued retries are not
+        # joined, preserving demand priority.
         if location in (None, "LocalCPUBackend"):
             local_cpu_backend = self._local_cpu_backend()
             if local_cpu_backend is not None:
@@ -1224,6 +1728,11 @@ class StorageManager:
             # are allocated by the allocator backend.
             memory_obj = backend.get_blocking(key)
             if memory_obj:
+                if backend_name == "CxlBackend":
+                    # The serving path already obtained the data from CXL, so
+                    # any still-queued speculative promotion for this key is
+                    # no longer useful for the current request.
+                    self._mark_cxl_prefetch_demand_won(key)
                 if backend_name == "LocalCPUBackend" and isinstance(
                     backend, LocalCPUBackend
                 ):
@@ -1257,8 +1766,20 @@ class StorageManager:
                             "get: failed to cache key %s into LocalCPUBackend; skipping",
                             getattr(key, "chunk_hash", key),
                         )
+                self._log_cxl_prefetch_demand(
+                    request_id=request_id,
+                    key=key,
+                    memory_obj=memory_obj,
+                    backend_name=backend_name,
+                )
                 return memory_obj
 
+        self._log_cxl_prefetch_demand(
+            request_id=request_id,
+            key=key,
+            memory_obj=None,
+            backend_name="MISS",
+        )
         return None
 
     def get_non_blocking(
@@ -1296,19 +1817,34 @@ class StorageManager:
         for backend_name, storage_backend in self.get_active_storage_backends(location):
             memory_objs = storage_backend.batched_get_blocking(keys)
             if memory_objs:
-                if backend_name == "LocalCPUBackend" and isinstance(
-                    storage_backend, LocalCPUBackend
-                ):
-                    for key, memory_obj in zip(keys, memory_objs, strict=False):
-                        if memory_obj is not None:
-                            storage_backend.mark_demand_access(key)
-                            self._log_cxl_prefetch_demand(
-                                request_id=request_id,
-                                key=key,
-                                memory_obj=memory_obj,
-                                backend_name=backend_name,
-                            )
+                for index, key in enumerate(keys):
+                    memory_obj = (
+                        memory_objs[index] if index < len(memory_objs) else None
+                    )
+                    if (
+                        memory_obj is not None
+                        and backend_name == "LocalCPUBackend"
+                        and isinstance(storage_backend, LocalCPUBackend)
+                    ):
+                        storage_backend.mark_demand_access(key)
+                    if memory_obj is not None and backend_name == "CxlBackend":
+                        # The CXL result is already in the demand path.  Do
+                        # not let a queued route-time promotion reread it.
+                        self._mark_cxl_prefetch_demand_won(key)
+                    self._log_cxl_prefetch_demand(
+                        request_id=request_id,
+                        key=key,
+                        memory_obj=memory_obj,
+                        backend_name=backend_name,
+                    )
                 return memory_objs
+        for key in keys:
+            self._log_cxl_prefetch_demand(
+                request_id=request_id,
+                key=key,
+                memory_obj=None,
+                backend_name="MISS",
+            )
         return None
 
     def layerwise_batched_get(
@@ -1348,8 +1884,20 @@ class StorageManager:
         Callback function when a single prefetch task
         (i.e., prefetching from a single backend) is done.
         """
-        # TODO(Jiayi): support write-back policy here
-        pass
+        # A route-time hint can race with the asynchronous demand lookup.  If
+        # demand actually loaded a chunk from CXL, retire the corresponding
+        # speculative promotion just as the synchronous path does.
+        if backend_name != "CxlBackend":
+            return
+        try:
+            memory_objs = future.result()
+        except Exception:
+            return
+        if memory_objs is None:
+            return
+        for key, memory_obj in zip(keys, memory_objs, strict=False):
+            if memory_obj is not None:
+                self._mark_cxl_prefetch_demand_won(key)
 
     def prefetch_all_done_callback(
         self,
@@ -1473,10 +2021,9 @@ class StorageManager:
         # chunks than its lookup result indicated. This is especially helpful
         # for P2PBackend.
 
-        # Let the currently executing route-time prefix complete before the
-        # async lookup asks CXL for the same objects.  ``wrap_future`` keeps the
-        # StorageManager event loop non-blocking while retaining fail-open
-        # fallback semantics below.
+        # Join only a currently executing single-chunk promotion. A queued
+        # retry must not block the demand lookup; backend access below will
+        # acquire the serving-priority CXL slot and make the normal fallback.
         await self._await_cxl_prefetch_prefix(keys, search_range)
 
         num_total_chunks = len(keys)
@@ -1684,6 +2231,10 @@ class StorageManager:
         each value is a list of chunk infos in the backend.
         """
         keys = [chunk_info[0] for chunk_info in chunk_infos]
+        # Wait only for an already-running promotion attempt. A queued retry
+        # must not delay demand; the backend scan below rechecks LocalCPU and
+        # then enters the serving-priority CXL path if needed.
+        self._wait_for_cxl_prefetches(keys)
         total_keys = len(keys)
         block_mapping = {}
         total_hit_chunks = 0
@@ -1782,6 +2333,7 @@ class StorageManager:
     def clear(
         self,
         locations: Optional[List[str]] = None,
+        keep_fraction: Optional[float] = None,
     ) -> int:
         """
         Clear all caches in the specified locations.
@@ -1800,7 +2352,12 @@ class StorageManager:
             # TODO(Jiayi): need to handle remove in non-cpu backends
             if locations is None or backend_name in locations:
                 if hasattr(backend, "clear"):
-                    num_cleared_tokens += backend.clear()
+                    if backend_name == "CxlBackend" and keep_fraction is not None:
+                        num_cleared_tokens += backend.clear(
+                            keep_fraction=keep_fraction
+                        )
+                    else:
+                        num_cleared_tokens += backend.clear()
                 else:
                     logger.warning(
                         f"Storage backend {backend_name} does not support "
@@ -1875,9 +2432,30 @@ class StorageManager:
                 task.state = PrefetchState.CANCELLED
             self.prefetch_inflight.clear()
 
-        # Stop speculative workers before closing CXL/CPU backends.  Waiting
-        # for admitted tasks preserves object ownership and lets their Future
-        # callbacks release the bounded semaphore cleanly.
+        # Stop the bounded prefetch queue before closing CXL/CPU backends.
+        # Pending work is completed as a shutdown failure; an already-running
+        # single-chunk attempt is allowed to finish so its temporary objects
+        # are released before the backend is closed.
+        queued_work: list[_CxlPrefetchWork] = []
+        if self._cxl_prefetch_dispatcher is not None:
+            with self._cxl_prefetch_condition:
+                self._cxl_prefetch_stopping = True
+                queued_work = list(self._cxl_prefetch_queue)
+                self._cxl_prefetch_queue.clear()
+                for work in queued_work:
+                    if self._cxl_prefetch_pending.get(work.key) is work:
+                        self._cxl_prefetch_pending.pop(work.key, None)
+                self._cxl_prefetch_condition.notify_all()
+            self._cxl_prefetch_dispatcher.join(timeout=10.0)
+            if self._cxl_prefetch_dispatcher.is_alive():
+                logger.warning(
+                    "CXL prefetch dispatcher did not terminate within 10s"
+                )
+            self._cxl_prefetch_dispatcher = None
+
+        for work in queued_work:
+            self._set_cxl_prefetch_terminal_result(work, False, "shutdown")
+
         if self._cxl_prefetch_executor is not None:
             try:
                 self._cxl_prefetch_executor.shutdown(
@@ -1885,7 +2463,7 @@ class StorageManager:
                     cancel_futures=True,
                 )
             except Exception:
-                logger.exception("Failed to close CXL lookahead promotion executor")
+                logger.exception("Failed to close CXL prefetch promotion executor")
             finally:
                 self._cxl_prefetch_executor = None
 
